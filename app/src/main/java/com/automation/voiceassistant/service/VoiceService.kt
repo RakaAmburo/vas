@@ -7,11 +7,14 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import androidx.core.app.NotificationCompat
 import com.automation.voiceassistant.MainActivity
 import com.automation.voiceassistant.network.OpenClawClient
@@ -32,6 +35,8 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     private var speechRecognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
     private var isListening = false
+    private var isProcessing = false
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(Dispatchers.IO)
 
     override fun onCreate() {
@@ -48,7 +53,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                 startListening()
             }
             ACTION_STOP -> {
-                stopListening()
+                destroyRecognizer()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
@@ -57,11 +62,13 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun initSpeechRecognizer() {
+        destroyRecognizer()
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
         speechRecognizer?.setRecognitionListener(object : RecognitionListener {
             override fun onResults(results: Bundle?) {
-                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                val text = matches?.firstOrNull() ?: return
+                if (isProcessing) return
+                val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    ?.firstOrNull() ?: return
                 updateNotification("Procesando: $text")
                 sendToOpenClaw(text)
             }
@@ -72,10 +79,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
 
             override fun onError(error: Int) {
                 isListening = false
-                if (error != SpeechRecognizer.ERROR_NO_MATCH) {
-                    updateNotification("Error $error - reintentando...")
-                }
-                restartListening()
+                if (!isProcessing) restartListening()
             }
 
             override fun onReadyForSpeech(params: Bundle?) { updateNotification("Escuchando...") }
@@ -88,7 +92,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun startListening() {
-        if (isListening) return
+        if (isListening || isProcessing) return
         isListening = true
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
@@ -99,10 +103,15 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun restartListening() {
-        android.os.Handler(mainLooper).postDelayed({ startListening() }, 500)
+        mainHandler.postDelayed({
+            if (!isProcessing) {
+                if (speechRecognizer == null) initSpeechRecognizer()
+                startListening()
+            }
+        }, 500)
     }
 
-    private fun stopListening() {
+    private fun destroyRecognizer() {
         isListening = false
         speechRecognizer?.stopListening()
         speechRecognizer?.destroy()
@@ -110,7 +119,9 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun sendToOpenClaw(text: String) {
-        stopListening() // para el mic mientras procesa
+        isProcessing = true
+        destroyRecognizer()
+
         val prefs = getSharedPreferences("vas_prefs", MODE_PRIVATE)
         val host  = prefs.getString("host", "") ?: ""
         val port  = prefs.getString("port", "18789") ?: "18789"
@@ -120,34 +131,54 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
 
         scope.launch {
             val response = OpenClawClient.sendMessage(applicationContext, host, port, token, text) { msg, isError ->
-                android.os.Handler(mainLooper).post { log(msg, isError) }
+                mainHandler.post { log(msg, isError) }
             }
-            when {
-                response == null -> {
-                    log("Error de conexión", isError = true)
-                    speak("Error de conexión")
-                }
-                response.startsWith("PAIRING:") -> {
-                    val requestId = response.substringAfter(":")
-                    log("Pairing: $requestId", isError = true)
-                    speak("Aprueba el dispositivo en la Raspberry")
-                }
-                else -> {
-                    log("Respuesta: $response")
-                    speak(response)
+            mainHandler.post {
+                when {
+                    response == null -> {
+                        log("Error de conexión", isError = true)
+                        isProcessing = false
+                        initSpeechRecognizer()
+                        restartListening()
+                    }
+                    response.startsWith("PAIRING:") -> {
+                        val requestId = response.substringAfter(":")
+                        log("Pairing: $requestId", isError = true)
+                        speak("Aprueba el dispositivo en la Raspberry")
+                    }
+                    else -> {
+                        log("Respuesta: $response")
+                        speak(response)
+                    }
                 }
             }
-            restartListening() // reactiva mic cuando termina
         }
     }
 
     private fun speak(text: String) {
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, null)
+        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "tts_done")
     }
 
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
             tts?.language = Locale("es", "ES")
+            tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(utteranceId: String?) {}
+                override fun onDone(utteranceId: String?) {
+                    mainHandler.post {
+                        isProcessing = false
+                        initSpeechRecognizer()
+                        restartListening()
+                    }
+                }
+                override fun onError(utteranceId: String?) {
+                    mainHandler.post {
+                        isProcessing = false
+                        initSpeechRecognizer()
+                        restartListening()
+                    }
+                }
+            })
         }
     }
 
@@ -177,7 +208,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        stopListening()
+        destroyRecognizer()
         tts?.stop()
         tts?.shutdown()
         super.onDestroy()

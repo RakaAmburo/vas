@@ -145,11 +145,12 @@ object OpenClawClient {
                         if (stream == "assistant") {
                             val delta = p.optJSONObject("data")?.optString("delta") ?: ""
                             if (delta.isNotEmpty()) result.append(delta)
-                            if (p.optBoolean("done", false)) {
-                                onLog("← ${result}", false)
-                                latch.countDown()
-                            }
+                        } else if (stream == "lifecycle" &&
+                            p?.optJSONObject("data")?.optString("phase") == "end") {
+                            onLog("← closing!!", false)
+                            latch.countDown()
                         }
+
                     }
                 }
             }

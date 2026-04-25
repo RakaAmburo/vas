@@ -59,6 +59,8 @@ dependencies {
     implementation(libs.androidx.material3)
     implementation("org.java-websocket:Java-WebSocket:1.5.4")
     implementation("net.i2p.crypto:eddsa:0.3.0")
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    implementation("androidx.compose.material:material-icons-extended")
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

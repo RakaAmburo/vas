@@ -19,6 +19,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.QrCode
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -29,11 +31,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.automation.voiceassistant.service.VoiceService
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var prefs: SharedPreferences
-    private val logs = mutableStateListOf<Pair<String, Boolean>>() // text, isError
+    private val logs = mutableStateListOf<Pair<String, Boolean>>()
 
     private val logReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -50,11 +54,22 @@ class MainActivity : ComponentActivity() {
         if (perms.values.all { it }) startVoiceService()
     }
 
+    // QR scanner launcher usando zxing-android-embedded
+    private var onQrScanned: ((String) -> Unit)? = null
+    private val qrLauncher = registerForActivityResult(ScanContract()) { result ->
+        result.contents?.let { scanned ->
+            onQrScanned?.invoke(scanned)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences("vas_prefs", MODE_PRIVATE)
-        registerReceiver(logReceiver, IntentFilter("com.automation.voiceassistant.LOG"),
-            RECEIVER_NOT_EXPORTED)
+        registerReceiver(
+            logReceiver,
+            IntentFilter("com.automation.voiceassistant.LOG"),
+            RECEIVER_NOT_EXPORTED
+        )
         setContent {
             Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                 MainScreen()
@@ -75,8 +90,16 @@ class MainActivity : ComponentActivity() {
         var token by remember { mutableStateOf(prefs.getString("token", "") ?: "") }
         var showConfig by remember { mutableStateOf(false) }
 
+        // Callback para cuando el QR es escaneado — actualiza el state y prefs
+        onQrScanned = { scanned ->
+            token = scanned
+            prefs.edit().putString("token", scanned).apply()
+        }
+
         Column(
-            modifier = Modifier.fillMaxSize().padding(16.dp),
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
@@ -84,8 +107,15 @@ class MainActivity : ComponentActivity() {
 
             Button(
                 onClick = {
-                    if (isActive) { stopVoiceService(); isActive = false }
-                    else { if (checkPermissions()) { startVoiceService(); isActive = true } }
+                    if (isActive) {
+                        stopVoiceService()
+                        isActive = false
+                    } else {
+                        if (checkPermissions()) {
+                            startVoiceService()
+                            isActive = true
+                        }
+                    }
                 },
                 modifier = Modifier.size(120.dp),
                 shape = MaterialTheme.shapes.extraLarge,
@@ -103,36 +133,82 @@ class MainActivity : ComponentActivity() {
 
             if (showConfig) {
                 Column(
-                    modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    OutlinedTextField(value = host, onValueChange = { host = it; prefs.edit().putString("host", it).apply() },
-                        label = { Text("IP Tailscale") }, modifier = Modifier.fillMaxWidth())
-                    OutlinedTextField(value = port, onValueChange = { port = it; prefs.edit().putString("port", it).apply() },
-                        label = { Text("Puerto") }, modifier = Modifier.fillMaxWidth())
-                    OutlinedTextField(value = token, onValueChange = { token = it; prefs.edit().putString("token", it).apply() },
-                        label = { Text("Token OpenClaw") }, visualTransformation = PasswordVisualTransformation(),
-                        modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(
+                        value = host,
+                        onValueChange = { host = it; prefs.edit().putString("host", it).apply() },
+                        label = { Text("IP Tailscale") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = port,
+                        onValueChange = { port = it; prefs.edit().putString("port", it).apply() },
+                        label = { Text("Puerto") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    // Token con botón de QR
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = token,
+                            onValueChange = { token = it; prefs.edit().putString("token", it).apply() },
+                            label = { Text("Token OpenClaw") },
+                            visualTransformation = PasswordVisualTransformation(),
+                            modifier = Modifier.weight(1f)
+                        )
+                        IconButton(
+                            onClick = {
+                                val options = ScanOptions().apply {
+                                    setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                                    setPrompt("Escanea el QR del token")
+                                    setBeepEnabled(true)
+                                    setBarcodeImageEnabled(false)
+                                }
+                                qrLauncher.launch(options)
+                            }
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.QrCode,
+                                contentDescription = "Escanear QR",
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    }
                 }
             }
 
-            // Historial
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
                 Text("Historial", style = MaterialTheme.typography.titleSmall)
-                TextButton(onClick = { logs.clear() }) { Text("Limpiar", fontSize = 12.sp) }
+                TextButton(onClick = { logs.clear() }) {
+                    Text("Limpiar", fontSize = 12.sp)
+                }
             }
 
             LazyColumn(
-                modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceVariant),
-                state = rememberLazyListState(),
-                reverseLayout = false
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(MaterialTheme.colorScheme.surfaceVariant),
+                state = rememberLazyListState()
             ) {
                 items(logs) { (msg, isError) ->
                     Text(
                         text = msg,
                         color = if (isError) Color.Red else MaterialTheme.colorScheme.onSurface,
                         fontSize = 13.sp,
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp)
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
                     )
                     Divider(thickness = 0.5.dp)
                 }
@@ -142,16 +218,25 @@ class MainActivity : ComponentActivity() {
 
     private fun checkPermissions(): Boolean {
         val perms = mutableListOf(Manifest.permission.RECORD_AUDIO)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) perms.add(Manifest.permission.POST_NOTIFICATIONS)
-        val missing = perms.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
-        return if (missing.isEmpty()) true else { permissionLauncher.launch(missing.toTypedArray()); false }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+            perms.add(Manifest.permission.POST_NOTIFICATIONS)
+        val missing = perms.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        return if (missing.isEmpty()) true
+        else { permissionLauncher.launch(missing.toTypedArray()); false }
     }
 
     private fun startVoiceService() {
-        ContextCompat.startForegroundService(this, Intent(this, VoiceService::class.java).apply { action = VoiceService.ACTION_START })
+        ContextCompat.startForegroundService(
+            this,
+            Intent(this, VoiceService::class.java).apply { action = VoiceService.ACTION_START }
+        )
     }
 
     private fun stopVoiceService() {
-        startService(Intent(this, VoiceService::class.java).apply { action = VoiceService.ACTION_STOP })
+        startService(
+            Intent(this, VoiceService::class.java).apply { action = VoiceService.ACTION_STOP }
+        )
     }
 }

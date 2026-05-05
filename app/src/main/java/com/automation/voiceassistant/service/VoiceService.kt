@@ -15,6 +15,9 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.view.KeyEvent
+import android.support.v4.media.session.MediaSessionCompat
+import android.support.v4.media.session.PlaybackStateCompat
 import androidx.core.app.NotificationCompat
 import com.automation.voiceassistant.MainActivity
 import com.automation.voiceassistant.network.OpenClawClient
@@ -33,6 +36,10 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         const val ACTION_START  = "START"
         const val ACTION_STOP   = "STOP"
         private const val DEFAULT_SEND_KEYWORD = "cambio"
+        private const val DOUBLE_TAP_WINDOW_MS = 400L
+
+        // Static so it survives across service starts triggered by the first headset tap
+        var lastButtonPressMs = 0L
     }
 
     // ── State machine ────────────────────────────────────────────────
@@ -57,6 +64,10 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     private val job   = SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.IO + job)
 
+    // ── Bluetooth headset double-tap ─────────────────────────────────
+    private var mediaSession: MediaSessionCompat? = null
+    private var lastButtonPressMs = 0L
+
     // ── Keyword / text accumulation ──────────────────────────────────
     private val accumulatedText = StringBuilder()
     private var sendKeyword = DEFAULT_SEND_KEYWORD
@@ -74,9 +85,21 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         super.onCreate()
         tts = TextToSpeech(this, this)
         createNotificationChannel()
+        initMediaSession()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Handle headset button events routed here by HeadsetButtonReceiver
+        if (intent?.action == Intent.ACTION_MEDIA_BUTTON) {
+            val event = intent.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
+            if (event?.action == KeyEvent.ACTION_DOWN &&
+                (event.keyCode == KeyEvent.KEYCODE_HEADSETHOOK ||
+                 event.keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)) {
+                handleHeadsetButton()
+            }
+            return START_STICKY
+        }
+
         when (intent?.action) {
             ACTION_START -> {
                 isServiceActive = true
@@ -99,6 +122,8 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         destroyRecognizer()
         tts?.stop()
         tts?.shutdown()
+        mediaSession?.isActive = false
+        mediaSession?.release()
         scope.launch { OpenClawClient.disconnect() }
         scope.cancel()
         super.onDestroy()
@@ -243,8 +268,49 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     // ── TTS ──────────────────────────────────────────────────────────
 
     private fun speak(text: String) {
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "tts_done")
+        val clean = cleanForTts(text)
+        if (clean.isBlank()) {
+            // Nothing left to say after cleaning — skip straight back to listening
+            mainHandler.post {
+                if (isServiceActive && serviceState == ServiceState.SPEAKING) {
+                    serviceState = ServiceState.LISTENING
+                    initSpeechRecognizer()
+                    startListening()
+                }
+            }
+            return
+        }
+        tts?.speak(clean, TextToSpeech.QUEUE_FLUSH, null, "tts_done")
     }
+
+    /**
+     * Strips characters that degrade TTS quality:
+     * - Markdown formatting (bold, italic, headers, code blocks, lists)
+     * - URLs
+     * - Symbols that get spelled out awkwardly (#, *, _, ~, `, [, ], etc.)
+     * Keeps: letters (including accented/ñ), digits, spaces, and punctuation
+     * that influences speech rhythm (. , ; : ! ? - ' " ( ) …)
+     */
+    private fun cleanForTts(input: String): String = input
+        // Fenced code blocks  ```…```
+        .replace(Regex("```[\\s\\S]*?```"), " ")
+        // Inline code  `…`
+        .replace(Regex("`[^`\n]*`"), "$1")// fix
+        // Bold/italic markers  *** ** * ___ __ _
+        .replace(Regex("\\*{1,3}|_{1,3}"), "")
+        // Markdown headers  # ## ###
+        .replace(Regex("^#{1,6}\\s*", RegexOption.MULTILINE), "")
+        // Markdown unordered list bullets  - item / * item
+        .replace(Regex("^[\\-\\*]\\s+", RegexOption.MULTILINE), "")
+        // Markdown horizontal rules  --- ***
+        .replace(Regex("^[-\\*]{3,}\\s*$", RegexOption.MULTILINE), " ")
+        // URLs  http:// https://
+        .replace(Regex("https?://\\S+"), " ")
+        // Characters that add no spoken value
+        .replace(Regex("[#~\\[\\]{}|\\\\@$%^&+=<>()\"\\-]"), "")// fix
+        // Normalize whitespace (multiple spaces / newlines → single space)
+        .replace(Regex("\\s+"), " ")
+        .trim()
 
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
@@ -278,6 +344,58 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                     }
                 }
             })
+        }
+    }
+
+    // ── Bluetooth headset ────────────────────────────────────────────
+
+    private fun initMediaSession() {
+        val playbackState = PlaybackStateCompat.Builder()
+            .setActions(PlaybackStateCompat.ACTION_PLAY_PAUSE)
+            .setState(PlaybackStateCompat.STATE_STOPPED, 0, 0f)
+            .build()
+
+        mediaSession = MediaSessionCompat(this, "VoiceAssistantSession").apply {
+            setPlaybackState(playbackState)
+            setCallback(object : MediaSessionCompat.Callback() {
+                override fun onMediaButtonEvent(mediaButtonEvent: Intent): Boolean {
+                    val event = mediaButtonEvent.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
+                    if (event?.action == KeyEvent.ACTION_DOWN &&
+                        (event.keyCode == KeyEvent.KEYCODE_HEADSETHOOK ||
+                         event.keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)) {
+                        handleHeadsetButton()
+                    }
+                    return true
+                }
+            })
+            isActive = true
+        }
+    }
+
+    private fun handleHeadsetButton() {
+        val now = System.currentTimeMillis()
+        if (now - lastButtonPressMs < DOUBLE_TAP_WINDOW_MS) {
+            lastButtonPressMs = 0L
+            log("Doble toque detectado")
+            toggleService()
+        } else {
+            lastButtonPressMs = now
+        }
+    }
+
+    private fun toggleService() {
+        if (!isServiceActive) {
+            // Service running but not yet connected (IDLE) or was stopped — start
+            isServiceActive = true
+            startForeground(NOTIFICATION_ID, buildNotification("Conectando..."))
+            val prefs   = getSharedPreferences("vas_prefs", MODE_PRIVATE)
+            sendKeyword = prefs.getString("send_keyword", DEFAULT_SEND_KEYWORD) ?: DEFAULT_SEND_KEYWORD
+            val host    = prefs.getString("host",  "") ?: ""
+            val port    = prefs.getString("port",  "18789") ?: "18789"
+            val token   = prefs.getString("token", "") ?: ""
+            launchConnect(host, port, token)
+        } else {
+            doStop()
         }
     }
 

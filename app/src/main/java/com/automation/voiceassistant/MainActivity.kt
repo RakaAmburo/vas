@@ -1,6 +1,7 @@
 package com.automation.voiceassistant
 
 import android.Manifest
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -9,6 +10,10 @@ import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
+import android.view.KeyEvent
+import android.view.WindowManager
+import android.view.accessibility.AccessibilityManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -20,6 +25,8 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.QrCode
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -27,9 +34,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import com.automation.voiceassistant.service.ButtonAccessibilityService
 import com.automation.voiceassistant.service.VoiceService
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
@@ -39,12 +48,23 @@ class MainActivity : ComponentActivity() {
     private lateinit var prefs: SharedPreferences
     private val logs = mutableStateListOf<Pair<String, Boolean>>()
 
+    // Estado activo accesible desde dispatchKeyEvent (AB Shutter 3) — observable por Compose
+    private val isServiceActive = mutableStateOf(false)
+
     private val logReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            val msg = intent.getStringExtra("message") ?: return
-            val isError = intent.getBooleanExtra("isError", false)
-            logs.add(0, Pair(msg, isError))
-            if (logs.size > 100) logs.removeLastOrNull()
+            when (intent.action) {
+                "com.automation.voiceassistant.LOG" -> {
+                    val msg = intent.getStringExtra("message") ?: return
+                    val isError = intent.getBooleanExtra("isError", false)
+                    logs.add(0, Pair(msg, isError))
+                    if (logs.size > 100) logs.removeLastOrNull()
+                }
+                VoiceService.ACTION_STATE -> {
+                    // Sincroniza el botón visual con el estado real del servicio
+                    isServiceActive.value = intent.getBooleanExtra(VoiceService.EXTRA_IS_ACTIVE, false)
+                }
+            }
         }
     }
 
@@ -52,6 +72,7 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) { perms ->
         if (perms.values.all { it }) startVoiceService()
+        // isServiceActive se actualiza vía broadcast desde VoiceService
     }
 
     // QR scanner launcher usando zxing-android-embedded
@@ -64,11 +85,23 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Mantiene la pantalla encendida mientras la app esté abierta
+        // → AB Shutter 3 (HID) funciona garantizado; el usuario baja el brillo al mínimo
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         prefs = getSharedPreferences("vas_prefs", MODE_PRIVATE)
         registerReceiver(
             logReceiver,
-            IntentFilter("com.automation.voiceassistant.LOG"),
+            IntentFilter().apply {
+                addAction("com.automation.voiceassistant.LOG")
+                addAction(VoiceService.ACTION_STATE)
+            },
             RECEIVER_NOT_EXPORTED
+        )
+        // Arranca el servicio en IDLE para que la MediaSession siempre esté activa
+        // y el botón BT funcione con pantalla apagada desde el primer uso
+        ContextCompat.startForegroundService(
+            this,
+            Intent(this, VoiceService::class.java)
         )
         setContent {
             Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
@@ -84,11 +117,13 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     fun MainScreen() {
-        var isActive by remember { mutableStateOf(false) }
+        val isActive by isServiceActive
+        var accessibilityOk by remember { mutableStateOf(isAccessibilityEnabled()) }
         var host by remember { mutableStateOf(prefs.getString("host", "") ?: "") }
         var port by remember { mutableStateOf(prefs.getString("port", "18789") ?: "18789") }
         var token by remember { mutableStateOf(prefs.getString("token", "") ?: "") }
         var showConfig by remember { mutableStateOf(false) }
+        var tokenVisible by remember { mutableStateOf(false) }
 
         // Callback para cuando el QR es escaneado — actualiza el state y prefs
         onQrScanned = { scanned ->
@@ -105,15 +140,37 @@ class MainActivity : ComponentActivity() {
         ) {
             Text("Voice Assistant", style = MaterialTheme.typography.headlineMedium)
 
+            // Banner: accesibilidad necesaria para pantalla apagada
+            if (!accessibilityOk) {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            "Para usar el AB Shutter 3 con pantalla apagada activa el servicio de accesibilidad.",
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            fontSize = 13.sp
+                        )
+                        TextButton(onClick = {
+                            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                        }) { Text("Abrir Accesibilidad") }
+                        TextButton(onClick = { accessibilityOk = isAccessibilityEnabled() }) {
+                            Text("Ya lo activé ✓")
+                        }
+                    }
+                }
+            }
+
             Button(
                 onClick = {
                     if (isActive) {
                         stopVoiceService()
-                        isActive = false
+                        isServiceActive.value = false
                     } else {
                         if (checkPermissions()) {
                             startVoiceService()
-                            isActive = true
+                            isServiceActive.value = true
                         }
                     }
                 },
@@ -161,7 +218,16 @@ class MainActivity : ComponentActivity() {
                             value = token,
                             onValueChange = { token = it; prefs.edit().putString("token", it).apply() },
                             label = { Text("Token OpenClaw") },
-                            visualTransformation = PasswordVisualTransformation(),
+                            visualTransformation = if (tokenVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                            trailingIcon = {
+                                IconButton(onClick = { tokenVisible = !tokenVisible }) {
+                                    Icon(
+                                        imageVector = if (tokenVisible) Icons.Default.LockOpen else Icons.Default.Lock,
+                                        contentDescription = if (tokenVisible) "Ocultar token" else "Mostrar token",
+                                        tint = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                            },
                             modifier = Modifier.weight(1f)
                         )
                         IconButton(
@@ -214,6 +280,35 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    // ── AB Shutter 3 (BT HID) — captura VOLUME_UP y VOLUME_DOWN ────────
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        when (keyCode) {
+            KeyEvent.KEYCODE_VOLUME_UP -> {
+                if (!isServiceActive.value) {
+                    if (checkPermissions()) {
+                        startVoiceService()
+                        isServiceActive.value = true
+                    }
+                }
+                return true  // consume: no sube el volumen
+            }
+            KeyEvent.KEYCODE_VOLUME_DOWN -> {
+                if (isServiceActive.value) {
+                    stopVoiceService()
+                    isServiceActive.value = false
+                }
+                return true  // consume: no baja el volumen
+            }
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    private fun isAccessibilityEnabled(): Boolean {
+        val am = getSystemService(ACCESSIBILITY_SERVICE) as AccessibilityManager
+        val enabled = am.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
+        return enabled.any { it.resolveInfo.serviceInfo.name == ButtonAccessibilityService::class.java.name }
     }
 
     private fun checkPermissions(): Boolean {

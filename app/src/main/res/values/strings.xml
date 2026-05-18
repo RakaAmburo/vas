@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">Vas</string>
+    <string name="accessibility_service_description">Permite controlar Voice Assistant con los botones del AB Shutter 3 con la pantalla apagada</string>
 </resources>

@@ -1,5 +1,40 @@
 # VoiceAssistant — Architecture & Roadmap
 
+---
+
+> ## 🚫 REGLA DE ORO PARA EL ASISTENTE DE IA
+>
+> **PROHIBIDO modificar código existente que no haya sido explícitamente pedido por el usuario.**
+>
+> Esto incluye:
+> - NO reescribir funciones que ya funcionan aunque parezcan "mejorables"
+> - NO eliminar ni modificar comentarios ya existentes en el código
+> - NO condensar ni simplificar código que el usuario ya aprobó
+> - NO "aprovechar" una edición para limpiar o refactorizar otras partes del archivo
+>
+> Al usar herramientas de edición: usar `// ...existing code...` para TODO el código
+> que no sea parte del cambio solicitado. Si hay duda, NO tocar.
+>
+> Motivo: el usuario pierde trabajo y tiempo cuando se revierten cambios aprobados sin aviso.
+
+---
+
+---
+
+## ⛔ Regla de oro para el asistente de código
+
+**NUNCA modificar código existente que no haya sido explícitamente pedido.**
+
+- Si una tarea requiere editar un archivo, solo tocar las líneas exactas que corresponden al cambio solicitado.
+- Está prohibido reformatear, simplificar, eliminar comentarios, renombrar variables o alterar funciones que ya funcionan, aunque parezcan "mejorables".
+- Si el tool de edición aplica un cambio más amplio del esperado, **revertirlo inmediatamente** antes de continuar.
+- En caso de duda sobre el alcance del cambio, preguntar antes de editar.
+
+El motivo: cambios no solicitados en código funcional pueden romper comportamiento existente sin que el usuario lo note, generando pérdida de tiempo y trabajo.
+
+---
+
+
 ## Estado actual (baseline)
 
 - `OpenClawClient` (object singleton) — conecta WS, autentica y envía en un solo bloque
@@ -476,11 +511,25 @@ interface SpeechEngine {
 | Whisper API remota | Baja | Ninguna (HTTP) | ~1-3 s (red) | ❌ |
 | Whisper local (ONNX) | Media-Alta | ONNX Runtime (~20 MB) + modelo (~75-300 MB) | ~1-3 s on-device | ✅ |
 | Whisper local (whisper.cpp JNI) | Alta | Build nativo JNI, CMake | ~0.5-2 s | ✅ |
+| **faster-whisper en RPi 5** | Media | Servidor Python en RPi (~50 líneas) | ~1.5-3 s (LAN/internet) | ✅ (en casa) |
+| **Deepgram Nova-3 API** | Baja | API key + OkHttp WS | ~300 ms | ❌ |
+
+**`DeepgramSpeechEngine` — análisis y limitaciones:**
+- Streaming WebSocket en tiempo real: transcripciones parciales llegando continuamente, sin VAD propio.
+- Sin bips, sin timeouts, sin dependencia de Google.
+- La lógica de keyword (`"cambio"`) en `VoiceService` no cambia.
+- **Problema de costo con el patrón de uso real:** Deepgram cobra por tiempo de audio enviado,
+  incluyendo silencios. El flujo previsto (activar → pensar → hablar → "cambio") puede incluir
+  largos períodos de silencio que se cobran igual. VAD mitigaría esto (~30 líneas con RMS sobre
+  `AudioRecord`) pero añade complejidad.
+- **Conclusión:** Deepgram es ideal si el usuario habla de forma continua y fluida. No es óptimo
+  si hay pausas largas de reflexión entre activar y hablar. Para ese patrón, `faster-whisper`
+  en la RPi (audio enviado solo al detectar fin de turno) es más económico y predecible.
 
 **Selección de engine:**
-- En `VoiceService.onCreate()` según pref `speech_engine` ("android", "whisper", …)
+- En `VoiceService.onCreate()` según pref `speech_engine` ("android", "whisper", "deepgram", …)
 - La pref `speech_engine` se añadirá a la sección de configuración de `MainActivity` cuando
-  se implemente `WhisperSpeechEngine`.
+  se implemente cualquier engine alternativo.
 
 ### Interfaz `TtsEngine`
 
@@ -544,3 +593,267 @@ interface TtsEngine {
 | 3 — `WhisperSpeechEngine` local JNI | 🔴 Alta | Build nativo complejo; no recomendado como primera opción |
 | 3 — `onPartialResult` con Whisper | ❌ No viable | Whisper no soporta parciales nativos; será no-op en `WhisperSpeechEngine` |
 
+---
+
+## Feature — Métodos alternativos de activación START/STOP
+
+### Contexto
+El doble toque en auricular BT (`MediaSession`) no es fiable en todos los dispositivos
+(depende del perfil HFP/A2DP del auricular y de si el sistema enruta los eventos correctamente).
+Se documentan aquí las alternativas para evaluar e implementar según necesidad.
+
+### Opción A — Botón en la notificación persistente ✅ Recomendada inmediata
+
+**Cómo funciona:** La notificación foreground ya existe. Se añade una action "STOP" (y opcionalmente "START" cuando está parada) con un `PendingIntent` que dispara el intent correspondiente a `VoiceService`.
+
+**Pros:**
+- Sin permisos adicionales
+- Sin dependencias nuevas
+- ~15 líneas de código en `buildNotification()`
+- Accesible desde el panel de notificaciones sin desbloquear el teléfono
+
+**Contras:**
+- Requiere bajar el panel de notificaciones (un gesto)
+
+**Implementación:**
+```kotlin
+// En buildNotification() — añadir action según estado
+val stopPi = PendingIntent.getService(
+    this, 1,
+    Intent(this, VoiceService::class.java).apply { action = ACTION_STOP },
+    PendingIntent.FLAG_IMMUTABLE
+)
+NotificationCompat.Builder(this, CHANNEL_ID)
+    // ...existing...
+    .addAction(android.R.drawable.ic_media_pause, "Stop", stopPi)
+    .build()
+```
+
+**Archivos afectados:** solo `VoiceService.kt` (`buildNotification()`)
+
+---
+
+### Opción B — Sacudir el teléfono (Shake) 🟡 Media complejidad
+
+**Cómo funciona:** `SensorManager` + `TYPE_ACCELEROMETER`. Se calcula la magnitud del vector de aceleración; si supera un umbral (~2.5g) durante >100ms se considera shake. Dos shakes en <1s = toggle.
+
+**Pros:**
+- Sin permisos adicionales
+- Funciona con teléfono en el bolsillo
+- Muy natural como gesto "de emergencia"
+
+**Contras:**
+- Puede activarse accidentalmente al correr o en transporte
+- Consume batería (sensor activo continuamente mientras el servicio corre)
+- El umbral necesita calibración por dispositivo
+
+**Implementación:**
+```kotlin
+// En VoiceService — registrar sensor en onCreate(), desregistrar en onDestroy()
+private lateinit var sensorManager: SensorManager
+private var lastShakeMs = 0L
+
+// SensorEventListener.onSensorChanged():
+val magnitude = sqrt(x*x + y*y + z*z) - SensorManager.GRAVITY_EARTH
+if (magnitude > 25f) {  // ~2.5g threshold
+    val now = System.currentTimeMillis()
+    if (now - lastShakeMs < 1000) toggleService()
+    lastShakeMs = now
+}
+```
+
+**Archivos afectados:** `VoiceService.kt`
+**Permiso necesario:** ninguno
+
+---
+
+### Opción C — Quick Settings Tile 🟡 Media complejidad
+
+**Cómo funciona:** `TileService` — aparece en el panel de ajustes rápidos (junto a WiFi, linterna, etc.). El usuario lo añade una vez y desde entonces un toque activa/para el servicio.
+
+**Pros:**
+- Accesible con un swipe desde cualquier pantalla, incluso bloqueada
+- Muy visible — muestra el estado actual (activo/inactivo) con icono
+- La solución más ergonómica para uso frecuente
+
+**Contras:**
+- El usuario tiene que añadir el tile manualmente la primera vez (Settings → Edit tiles)
+- Requiere un archivo nuevo `VoiceAssistantTile.kt` + entrada en `AndroidManifest.xml`
+- Android 7+ (API 24)
+
+**Implementación:**
+```kotlin
+class VoiceAssistantTile : TileService() {
+    override fun onClick() {
+        val isRunning = // comprobar si VoiceService está corriendo
+        if (isRunning) {
+            startService(Intent(this, VoiceService::class.java).apply { action = VoiceService.ACTION_STOP })
+            qsTile.state = Tile.STATE_INACTIVE
+        } else {
+            ContextCompat.startForegroundService(this,
+                Intent(this, VoiceService::class.java).apply { action = VoiceService.ACTION_START })
+            qsTile.state = Tile.STATE_ACTIVE
+        }
+        qsTile.updateTile()
+    }
+}
+```
+
+**Archivos afectados:** `VoiceAssistantTile.kt` (nuevo), `AndroidManifest.xml`
+**Permiso necesario:** ninguno
+
+---
+
+### Opción D — Widget en pantalla de inicio 🔴 Más trabajo
+
+**Cómo funciona:** `AppWidgetProvider` — icono/botón en la pantalla de inicio que el usuario añade como widget.
+
+**Pros:** acceso directo desde la pantalla de inicio
+
+**Contras:** requiere layout XML, `AppWidgetProvider`, `AppWidgetManager`, entrada en manifest y metadata XML. Más código que el tile con menos ventajas.
+
+**Recomendación:** preferir Tile (Opción C) sobre Widget para este caso de uso.
+
+---
+
+### Opción E — Auricular BT (estado actual) 🔴 No fiable en todos los dispositivos
+
+Ver sección **Feature — Control por auricular Bluetooth (doble toque)**.
+El problema es que Android no garantiza el enrutado de `KEYCODE_HEADSETHOOK` /
+`KEYCODE_MEDIA_PLAY_PAUSE` a nuestra `MediaSession` en todos los fabricantes/modelos.
+Algunos auriculares BT LE (BLE Audio) directamente no emiten estos eventos.
+
+---
+
+### Orden de implementación sugerido para activación alternativa
+
+| Prioridad | Opción | Esfuerzo | Fiabilidad |
+|---|---|---|---|
+| 1 | A — Botón en notificación | Muy bajo (~15 líneas) | ✅ 100% fiable |
+| 2 | C — Quick Settings Tile | Medio (~50 líneas + manifest) | ✅ 100% fiable |
+| 3 | B — Shake | Medio (~40 líneas) | 🟡 Depende de umbral |
+| 4 | D — Widget | Alto | ✅ Fiable pero menos cómodo |
+| 5 | E — Auricular BT | Ya implementado | 🔴 Depende del dispositivo/auricular |
+
+---
+
+## 📋 Historial de sesiones — cambios implementados
+
+### Sesión 1 — TtsTextCleaner + bug fix de regex
+
+**Problema:** `cleanForTts` usaba `` `([^`\n]*)` `` → `"$1"` sin grupo de captura declarado, lo que producía una excepción en runtime y eliminaba el texto entre backticks en lugar de conservarlo.
+
+**Cambios:**
+- Nuevo archivo: `app/src/main/java/com/automation/voiceassistant/service/TtsTextCleaner.kt`
+  - Extraída la función `cleanForTts` de `VoiceService` a un objeto standalone para poder testarla sin dependencias Android
+  - Bug fix: `` `([^`\n]*)` `` → `"$1"` (grupo de captura correcto)
+  - Paso extra para eliminar backticks sueltos residuales
+  - El guion `-` removido del set de símbolos eliminados para no romper palabras compuestas
+- `VoiceService.kt`: `speak()` usa `TtsTextCleaner.clean(text)`, documentado con KDoc
+- Tests: 35 unit tests en `TtsTextCleanerTest.kt`, todos verdes
+
+---
+
+### Sesión 2 — AB Shutter 3: captura de botón BT
+
+**Objetivo:** Usar el AB Shutter 3 (BT HID) para START/STOP sin tocar el teléfono.
+
+**AB Shutter 3 tiene dos botones:**
+- Button 1 (modo iOS) → `KEYCODE_HEADSETHOOK` → va por MediaSession
+- Button 2 (modo Android) → `KEYCODE_VOLUME_UP` → va por sistema de audio/input
+
+**Cambios:**
+- `VoiceService.kt`:
+  - `MediaSessionCompat` inicializado en `onCreate()` con `FLAG_HANDLES_MEDIA_BUTTONS`
+  - `onMediaButtonEvent()` maneja `KEYCODE_HEADSETHOOK`, `KEYCODE_MEDIA_PLAY_PAUSE`, `KEYCODE_VOLUME_UP`, `KEYCODE_VOLUME_DOWN`
+  - `handleHeadsetButton()` con doble-tap detection (400ms window) → `toggleService()`
+  - `onStartCommand` también procesa `Intent.ACTION_MEDIA_BUTTON` (ruteado desde `HeadsetButtonReceiver`)
+- `receiver/HeadsetButtonReceiver.kt`: agregados `KEYCODE_VOLUME_UP` y `KEYCODE_VOLUME_DOWN` al filtro
+- `MainActivity.kt`:
+  - `isServiceActive` cambiado de `var Boolean` a `mutableStateOf(false)` para que Compose recomponga
+  - `onKeyDown()` override para capturar VOLUME_UP/DOWN cuando la app está en primer plano
+  - `isAccessibilityEnabled()` helper
+
+---
+
+### Sesión 3 — ButtonAccessibilityService (pantalla apagada)
+
+**Problema:** `onKeyDown` no funciona con pantalla apagada. Solución: `AccessibilityService` con `flagRequestFilterKeyEvents`.
+
+**Archivos nuevos:**
+- `service/ButtonAccessibilityService.kt`:
+  - Extiende `AccessibilityService`
+  - `onKeyEvent()` intercepta `KEYCODE_VOLUME_UP` → `ACTION_START` y `KEYCODE_VOLUME_DOWN` → `ACTION_STOP`
+  - `PARTIAL_WAKE_LOCK` de 2 segundos para asegurar que el intent llega aunque el CPU esté dormido
+  - `onServiceConnected()` inicializa el WakeLock
+- `res/xml/accessibility_service_config.xml`:
+  - `flagRequestFilterKeyEvents`
+  - `accessibilityFeedbackType="feedbackAllMask"` (necesario para algunos OEM para funcionar con pantalla apagada)
+  - `canRequestFilterKeyEvents="true"`
+- `AndroidManifest.xml`:
+  - Declaración del servicio con `BIND_ACCESSIBILITY_SERVICE` y metadata del XML
+  - `WAKE_LOCK` permission
+- `MainActivity.kt`:
+  - Banner de error si la accesibilidad no está activada, con botón "Abrir Accesibilidad" y "Ya lo activé ✓"
+
+**Nota:** El usuario (Realme/ColorOS) necesita activar el servicio en: Settings → Additional Settings → Accessibility → Installed Services → Botones Shutter.
+
+**Resultado en Realme:** El `AccessibilityService` con `flagRequestFilterKeyEvents` NO recibe `KEYCODE_VOLUME_UP/DOWN` con pantalla apagada en Realme. Es una restricción del fabricante irresolvible desde código.
+
+---
+
+### Sesión 4 — Rediseño: servicio persistente + MediaSession siempre activa
+
+**Diagnóstico:** El problema raíz era que al hacer STOP, `VoiceService` llamaba `stopSelf()`, destruyendo la `MediaSession`. Sin `MediaSession` activa, Android no sabe a quién enviar el evento del botón BT con pantalla apagada.
+
+**Solución:** Patrón de apps de música — `VoiceService` **nunca se destruye completamente**; al hacer STOP solo desconecta el WebSocket y queda en estado IDLE con la `MediaSession` activa.
+
+**Cambios en `VoiceService.kt`:**
+- `onCreate()`: llama `startForeground()` inmediatamente (IDLE), ya no espera `ACTION_START`
+- `doStop()`: ya NO llama `stopSelf()` ni `stopForeground()`. Solo desconecta WS y vuelve a IDLE
+- `doKill()` (nuevo): detiene el servicio completamente; llamado solo por `ACTION_KILL`
+- `ACTION_KILL` agregado al companion object
+- `handleHeadsetButton()`: simplificado a un toggle de un solo toque (sin doble-tap) — más fiable
+- `initMediaSession()`:
+  - Usa `MediaSessionCompat(context, tag, receiverComponent, pendingIntent)` constructor
+  - Llama `setMediaButtonReceiver(pendingIntent)` — persiste el registro aunque la sesión se destruya
+  - `FLAG_HANDLES_MEDIA_BUTTONS or FLAG_HANDLES_TRANSPORT_CONTROLS`
+  - `PlaybackState = STATE_PAUSED` (no `STATE_STOPPED`) — Android solo entrega media buttons a sesiones en PAUSED o PLAYING
+- `updatePlaybackState(playing: Boolean)`: actualiza el estado dinámicamente según `serviceState`
+- `serviceState` setter: llama `updatePlaybackState()` en cada transición
+- Notificación IDLE: "Listo — presiona el botón para iniciar"
+- `isServiceActive`: convertido a field con setter que hace `broadcastActive()`
+- `broadcastActive(active: Boolean)`: envía `ACTION_STATE` broadcast con `EXTRA_IS_ACTIVE`
+- `ACTION_STATE`, `EXTRA_IS_ACTIVE`: nuevas constantes en companion object
+- Canal de notificación: `IMPORTANCE_MIN` (sin ícono en status bar, silencioso, al fondo de la bandeja)
+
+**Cambios en `MainActivity.kt`:**
+- `onCreate()`: arranca el servicio sin acción (`startForegroundService` con intent vacío) para que la `MediaSession` se registre desde el primer uso
+- `logReceiver` ampliado: además de `LOG`, escucha `VoiceService.ACTION_STATE` para sincronizar `isServiceActive.value` con el estado real del servicio
+- `IntentFilter` registra tanto `LOG` como `ACTION_STATE`
+- `permissionLauncher`: comentario aclarando que `isServiceActive` se actualiza vía broadcast
+
+**HeadsetButtonReceiver:** prioridad aumentada a `Integer.MAX_VALUE` (2147483647) para ganar a cualquier otra app de música.
+
+**Resultado:** Con pantalla apagada la notificación persiste ("Listo..."), la `MediaSession` existe, pero el botón BT (AB Shutter 3 HID) aún no funciona con pantalla apagada en Realme.
+
+---
+
+### ⚠️ Estado abierto — Pantalla apagada + AB Shutter 3 en Realme
+
+**Conclusión actual:** El AB Shutter 3 es un dispositivo **BT HID puro**. En Realme/ColorOS, los eventos de teclado BT HID con pantalla apagada son bloqueados por el kernel/driver BT del fabricante **antes de llegar a Android**. Esto es irresolvible desde código de aplicación.
+
+**Lo que sí funciona:**
+- Button 1 (iOS/HEADSETHOOK) con pantalla **encendida** → MediaSession ✅
+- Button 2 (Android/VOLUME_UP) con pantalla **encendida** → onKeyDown / AccessibilityService ✅
+- Botón visual START/STOP en la app → siempre funciona ✅
+- Botón de notificación (por implementar, Opción A del plan) → funcionaría ✅
+
+**Para diagnosticar si los eventos llegan con pantalla apagada:**
+```bash
+adb logcat -s InputReader:* InputDispatcher:* MediaSessionService:* *:S 2>&1
+# Apagar pantalla, presionar botón, ver si aparece algo
+```
+
+**Alternativa más fiable para pantalla apagada:**
+- Usar un auricular BT con perfil **HFP/A2DP** (cualquier auricular de llamadas). Su botón play/pause usa AVRCP que tiene tratamiento especial en el kernel Android y sí despierta el dispositivo. Enviaría `KEYCODE_HEADSETHOOK` o `KEYCODE_MEDIA_PLAY_PAUSE` que ya están manejados por nuestra `MediaSession`.

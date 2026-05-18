@@ -16,6 +16,8 @@ class HeadsetButtonReceiver : BroadcastReceiver() {
         if (intent.action != Intent.ACTION_MEDIA_BUTTON) return
         val event = intent.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT) ?: return
         if (event.action != KeyEvent.ACTION_DOWN) return
+        // Solo HEADSETHOOK y MEDIA_PLAY_PAUSE llegan por el framework de media buttons.
+        // VOLUME_UP/DOWN van por el sistema de audio — nunca llegan aquí.
         if (event.keyCode != KeyEvent.KEYCODE_HEADSETHOOK &&
             event.keyCode != KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE) return
 

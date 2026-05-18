@@ -839,21 +839,36 @@ Algunos auriculares BT LE (BLE Audio) directamente no emiten estos eventos.
 
 ---
 
-### ⚠️ Estado abierto — Pantalla apagada + AB Shutter 3 en Realme
+### Sesión 5 — Solución definitiva pantalla apagada + limpieza general
 
-**Conclusión actual:** El AB Shutter 3 es un dispositivo **BT HID puro**. En Realme/ColorOS, los eventos de teclado BT HID con pantalla apagada son bloqueados por el kernel/driver BT del fabricante **antes de llegar a Android**. Esto es irresolvible desde código de aplicación.
+**Solución adoptada:** `FLAG_KEEP_SCREEN_ON` en `MainActivity.onCreate()` — una línea, 100% fiable, sin depender de MediaSession ni HID con pantalla apagada. El usuario baja el brillo al mínimo desde el panel.
 
-**Lo que sí funciona:**
-- Button 1 (iOS/HEADSETHOOK) con pantalla **encendida** → MediaSession ✅
-- Button 2 (Android/VOLUME_UP) con pantalla **encendida** → onKeyDown / AccessibilityService ✅
-- Botón visual START/STOP en la app → siempre funciona ✅
-- Botón de notificación (por implementar, Opción A del plan) → funcionaría ✅
+**Cambios:**
 
-**Para diagnosticar si los eventos llegan con pantalla apagada:**
-```bash
-adb logcat -s InputReader:* InputDispatcher:* MediaSessionService:* *:S 2>&1
-# Apagar pantalla, presionar botón, ver si aparece algo
-```
+**`MainActivity.kt`:**
+- `window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)` en `onCreate()`
+- `onKeyDown` VOLUME_UP cambiado a **toggle** (start si inactivo, stop si activo)
+- `onKeyDown` VOLUME_DOWN → **reservado para función futura** (consume el evento, no hace nada)
 
-**Alternativa más fiable para pantalla apagada:**
-- Usar un auricular BT con perfil **HFP/A2DP** (cualquier auricular de llamadas). Su botón play/pause usa AVRCP que tiene tratamiento especial en el kernel Android y sí despierta el dispositivo. Enviaría `KEYCODE_HEADSETHOOK` o `KEYCODE_MEDIA_PLAY_PAUSE` que ya están manejados por nuestra `MediaSession`.
+**Limpieza de intentos anteriores (ya no necesarios con pantalla siempre encendida):**
+- `ButtonAccessibilityService.kt` — **borrado**
+- `res/xml/accessibility_service_config.xml` — **borrado**
+- Entrada en `AndroidManifest.xml` del servicio de accesibilidad — **eliminada**
+- Permiso `WAKE_LOCK` en manifest — **eliminado**
+- Banner de accesibilidad en la UI de `MainActivity` — **eliminado**
+- `isAccessibilityEnabled()` y sus imports — **eliminados**
+- `screenOffReceiver` en `VoiceService` (intentó refrescar timestamp MediaSession al apagar pantalla) — **eliminado**
+- `updatePlaybackState` simplificado: siempre `STATE_PLAYING` (sin parámetro útil)
+- Notificación en IDLE: texto vacío (solo título "Voice Assistant")
+- `doStop()`: eliminada llamada redundante a `updateNotification`
+
+**`HeadsetButtonReceiver.kt`:** eliminados `KEYCODE_VOLUME_UP/DOWN` del filtro — nunca llegaron por MediaSession
+
+---
+
+### 🔒 VOLUME_DOWN — evento reservado
+
+**`KEYCODE_VOLUME_DOWN` en `MainActivity.onKeyDown`** está reservado para una función futura.  
+Actualmente consume el evento (no baja el volumen) pero no hace nada.  
+Al implementar la función futura, agregar la lógica dentro del `KeyEvent.KEYCODE_VOLUME_DOWN ->` en `MainActivity.onKeyDown`.
+

@@ -1,7 +1,6 @@
 package com.automation.voiceassistant
 
 import android.Manifest
-import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -10,10 +9,8 @@ import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.provider.Settings
 import android.view.KeyEvent
 import android.view.WindowManager
-import android.view.accessibility.AccessibilityManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -38,7 +35,6 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import com.automation.voiceassistant.service.ButtonAccessibilityService
 import com.automation.voiceassistant.service.VoiceService
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
@@ -118,7 +114,6 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun MainScreen() {
         val isActive by isServiceActive
-        var accessibilityOk by remember { mutableStateOf(isAccessibilityEnabled()) }
         var host by remember { mutableStateOf(prefs.getString("host", "") ?: "") }
         var port by remember { mutableStateOf(prefs.getString("port", "18789") ?: "18789") }
         var token by remember { mutableStateOf(prefs.getString("token", "") ?: "") }
@@ -140,27 +135,6 @@ class MainActivity : ComponentActivity() {
         ) {
             Text("Voice Assistant", style = MaterialTheme.typography.headlineMedium)
 
-            // Banner: accesibilidad necesaria para pantalla apagada
-            if (!accessibilityOk) {
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text(
-                            "Para usar el AB Shutter 3 con pantalla apagada activa el servicio de accesibilidad.",
-                            color = MaterialTheme.colorScheme.onErrorContainer,
-                            fontSize = 13.sp
-                        )
-                        TextButton(onClick = {
-                            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                        }) { Text("Abrir Accesibilidad") }
-                        TextButton(onClick = { accessibilityOk = isAccessibilityEnabled() }) {
-                            Text("Ya lo activé ✓")
-                        }
-                    }
-                }
-            }
 
             Button(
                 onClick = {
@@ -282,11 +256,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ── AB Shutter 3 (BT HID) — captura VOLUME_UP y VOLUME_DOWN ────────
+    // ── AB Shutter 3 (BT HID) ───────────────────────────────────────
+    // VOLUME_UP → toggle start/stop
+    // VOLUME_DOWN → reservado para función futura
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         when (keyCode) {
             KeyEvent.KEYCODE_VOLUME_UP -> {
-                if (!isServiceActive.value) {
+                if (isServiceActive.value) {
+                    stopVoiceService()
+                    isServiceActive.value = false
+                } else {
                     if (checkPermissions()) {
                         startVoiceService()
                         isServiceActive.value = true
@@ -295,21 +274,13 @@ class MainActivity : ComponentActivity() {
                 return true  // consume: no sube el volumen
             }
             KeyEvent.KEYCODE_VOLUME_DOWN -> {
-                if (isServiceActive.value) {
-                    stopVoiceService()
-                    isServiceActive.value = false
-                }
+                // Reservado — no hace nada por ahora
                 return true  // consume: no baja el volumen
             }
         }
         return super.onKeyDown(keyCode, event)
     }
 
-    private fun isAccessibilityEnabled(): Boolean {
-        val am = getSystemService(ACCESSIBILITY_SERVICE) as AccessibilityManager
-        val enabled = am.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
-        return enabled.any { it.resolveInfo.serviceInfo.name == ButtonAccessibilityService::class.java.name }
-    }
 
     private fun checkPermissions(): Boolean {
         val perms = mutableListOf(Manifest.permission.RECORD_AUDIO)

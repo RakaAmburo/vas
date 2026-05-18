@@ -5,11 +5,9 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Bundle
@@ -56,7 +54,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
             field = value
             log("→ ${value.name}")
             when (value) {
-                ServiceState.IDLE       -> { updateNotification("Listo — presiona el botón para iniciar"); updatePlaybackState(false) }
+                ServiceState.IDLE       -> { updateNotification(""); updatePlaybackState(false) }
                 ServiceState.LISTENING  -> { updateNotification("Escuchando..."); updatePlaybackState(true) }
                 ServiceState.PROCESSING -> { updateNotification("Procesando..."); updatePlaybackState(true) }
                 ServiceState.SPEAKING   -> { updateNotification("Respondiendo..."); updatePlaybackState(true) }
@@ -79,20 +77,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     // ── Bluetooth headset ────────────────────────────────────────────
     private var mediaSession: MediaSessionCompat? = null
 
-    /**
-     * Receptor dinámico para ACTION_SCREEN_OFF.
-     * Cuando la pantalla se apaga, refrescamos el timestamp STATE_PLAYING de nuestra sesión.
-     * Razón: Android 10+ despacha media buttons a la sesión con STATE_PLAYING MÁS RECIENTE.
-     * Si el usuario usó música antes de apagar, el reproductor tiene timestamp más nuevo.
-     * Al refrescar aquí, nuestra sesión queda como la "más activa" en el momento justo.
-     */
-    private val screenOffReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action == Intent.ACTION_SCREEN_OFF) {
-                updatePlaybackState(true)
-            }
-        }
-    }
 
 
     /** Actualiza el PlaybackState del MediaSession.
@@ -137,11 +121,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         tts = TextToSpeech(this, this)
         createNotificationChannel()
         initMediaSession()
-        // Registrar receptor de pantalla apagada para refrescar prioridad MediaSession
-        registerReceiver(screenOffReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF))
-        // Arranca siempre como foreground en IDLE para que la MediaSession este activa
-        // y pueda recibir el boton BT aunque la pantalla este apagada
-        startForeground(NOTIFICATION_ID, buildNotification("Listo — presiona el botón para iniciar"))
+        startForeground(NOTIFICATION_ID, buildNotification(""))
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -182,7 +162,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         destroyRecognizer()
         tts?.stop()
         tts?.shutdown()
-        unregisterReceiver(screenOffReceiver)
         mediaSession?.isActive = false
         mediaSession?.release()
         scope.launch { OpenClawClient.disconnect() }

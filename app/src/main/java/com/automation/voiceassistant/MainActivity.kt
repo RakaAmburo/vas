@@ -122,17 +122,24 @@ class MainActivity : ComponentActivity() {
         var showConfig by remember { mutableStateOf(false) }
         var tokenVisible by remember { mutableStateOf(false) }
         var soqueteTokenVisible by remember { mutableStateOf(false) }
+        // "openclaw" o "soquete" — indica qué campo se está escaneando
+        var qrTarget by remember { mutableStateOf("openclaw") }
 
-        // Callback para cuando el QR es escaneado — actualiza el state y prefs
+        // Callback para cuando el QR es escaneado — actualiza el state y prefs según qrTarget
         onQrScanned = { scanned ->
-            token = scanned
-            prefs.edit().putString("token", scanned).apply()
+            if (qrTarget == "soquete") {
+                soqueteToken = scanned
+                prefs.edit().putString("soquete_token", scanned).apply()
+            } else {
+                token = scanned
+                prefs.edit().putString("token", scanned).apply()
+            }
         }
 
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(16.dp),
+                .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
@@ -209,9 +216,10 @@ class MainActivity : ComponentActivity() {
                         )
                         IconButton(
                             onClick = {
+                                qrTarget = "openclaw"
                                 val options = ScanOptions().apply {
                                     setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                                    setPrompt("Escanea el QR del token")
+                                    setPrompt("Escanea el QR del token OpenClaw")
                                     setBeepEnabled(true)
                                     setBarcodeImageEnabled(false)
                                 }
@@ -235,22 +243,47 @@ class MainActivity : ComponentActivity() {
                         label = { Text("Puerto Soquete") },
                         modifier = Modifier.fillMaxWidth()
                     )
-                    OutlinedTextField(
-                        value = soqueteToken,
-                        onValueChange = { soqueteToken = it; prefs.edit().putString("soquete_token", it).apply() },
-                        label = { Text("Token Soquete") },
-                        visualTransformation = if (soqueteTokenVisible) VisualTransformation.None else PasswordVisualTransformation(),
-                        trailingIcon = {
-                            IconButton(onClick = { soqueteTokenVisible = !soqueteTokenVisible }) {
-                                Icon(
-                                    imageVector = if (soqueteTokenVisible) Icons.Default.LockOpen else Icons.Default.Lock,
-                                    contentDescription = if (soqueteTokenVisible) "Ocultar token" else "Mostrar token",
-                                    tint = MaterialTheme.colorScheme.primary
-                                )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = soqueteToken,
+                            onValueChange = { soqueteToken = it; prefs.edit().putString("soquete_token", it).apply() },
+                            label = { Text("Token Soquete") },
+                            visualTransformation = if (soqueteTokenVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                            trailingIcon = {
+                                IconButton(onClick = { soqueteTokenVisible = !soqueteTokenVisible }) {
+                                    Icon(
+                                        imageVector = if (soqueteTokenVisible) Icons.Default.LockOpen else Icons.Default.Lock,
+                                        contentDescription = if (soqueteTokenVisible) "Ocultar token" else "Mostrar token",
+                                        tint = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                            },
+                            modifier = Modifier.weight(1f)
+                        )
+                        IconButton(
+                            onClick = {
+                                qrTarget = "soquete"
+                                val options = ScanOptions().apply {
+                                    setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                                    setPrompt("Escanea el QR del token Soquete")
+                                    setBeepEnabled(true)
+                                    setBarcodeImageEnabled(false)
+                                }
+                                qrLauncher.launch(options)
                             }
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.QrCode,
+                                contentDescription = "Escanear QR Soquete",
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(16.dp))
                 }
             }
 
@@ -266,7 +299,8 @@ class MainActivity : ComponentActivity() {
 
             LazyColumn(
                 modifier = Modifier
-                    .fillMaxSize()
+                    .fillMaxWidth()
+                    .weight(1f)
                     .background(MaterialTheme.colorScheme.surfaceVariant),
                 state = rememberLazyListState()
             ) {

@@ -25,6 +25,7 @@ import android.support.v4.media.session.PlaybackStateCompat
 import androidx.core.app.NotificationCompat
 import com.automation.voiceassistant.MainActivity
 import com.automation.voiceassistant.network.OpenClawClient
+import com.automation.voiceassistant.network.SoqueteClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -44,6 +45,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         const val ACTION_STATE      = "com.automation.voiceassistant.SERVICE_STATE"
         const val EXTRA_IS_ACTIVE   = "is_active"
         private const val DEFAULT_SEND_KEYWORD = "cambio"
+        private const val DEFAULT_SOQUETE_KEYWORD = "zoquete"
     }
 
     // ── State machine ────────────────────────────────────────────────
@@ -100,7 +102,8 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
 
     // ── Keyword / text accumulation ──────────────────────────────────
     private val accumulatedText = StringBuilder()
-    private var sendKeyword = DEFAULT_SEND_KEYWORD
+    private var sendKeyword    = DEFAULT_SEND_KEYWORD
+    private var soqueteKeyword = DEFAULT_SOQUETE_KEYWORD
 
     // ── Pairing retry ────────────────────────────────────────────────
     private var isServiceActive = false
@@ -144,11 +147,14 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                 isServiceActive = true
                 updateNotification("Conectando...")
                 val prefs   = getSharedPreferences("vas_prefs", MODE_PRIVATE)
-                sendKeyword = prefs.getString("send_keyword", DEFAULT_SEND_KEYWORD) ?: DEFAULT_SEND_KEYWORD
-                val host    = prefs.getString("host",  "") ?: ""
-                val port    = prefs.getString("port",  "18789") ?: "18789"
-                val token   = prefs.getString("token", "") ?: ""
-                launchConnect(host, port, token)
+                sendKeyword    = prefs.getString("send_keyword", DEFAULT_SEND_KEYWORD) ?: DEFAULT_SEND_KEYWORD
+                soqueteKeyword = prefs.getString("soquete_keyword", DEFAULT_SOQUETE_KEYWORD) ?: DEFAULT_SOQUETE_KEYWORD
+                val host         = prefs.getString("host",  "") ?: ""
+                val port         = prefs.getString("port",  "18789") ?: "18789"
+                val token        = prefs.getString("token", "") ?: ""
+                val soquetePort  = prefs.getString("soquete_port",  "18690") ?: "18690"
+                val soqueteToken = prefs.getString("soquete_token", "") ?: ""
+                launchConnect(host, port, token, soquetePort, soqueteToken)
             }
             ACTION_STOP -> doStop()
             ACTION_KILL -> doKill()
@@ -164,7 +170,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         tts?.shutdown()
         mediaSession?.isActive = false
         mediaSession?.release()
-        scope.launch { OpenClawClient.disconnect() }
+        scope.launch { OpenClawClient.disconnect(); SoqueteClient.disconnect() }
         scope.cancel()
         super.onDestroy()
     }
@@ -173,7 +179,10 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
 
     // ── Connection ───────────────────────────────────────────────────
 
-    private fun launchConnect(host: String, port: String, token: String) {
+    private fun launchConnect(
+        host: String, port: String, token: String,
+        soquetePort: String = "", soqueteToken: String = ""
+    ) {
         scope.launch {
             val result = OpenClawClient.connect(applicationContext, host, port, token) { msg, isError ->
                 mainHandler.post { log(msg, isError) }
@@ -182,6 +191,14 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                 if (!isServiceActive) return@post
                 when (result) {
                     is OpenClawClient.ConnectResult.Success -> {
+                        // Conectar también el segundo WS (Soquete) si hay puerto configurado
+                        if (soquetePort.isNotEmpty()) {
+                            scope.launch {
+                                SoqueteClient.connect(host, soquetePort, soqueteToken) { msg, isError ->
+                                    mainHandler.post { log(msg, isError) }
+                                }
+                            }
+                        }
                         serviceState = ServiceState.LISTENING
                         initSpeechRecognizer()
                         startListening()
@@ -214,7 +231,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         serviceState    = ServiceState.IDLE
         destroyRecognizer()
         accumulatedText.clear()
-        scope.launch { OpenClawClient.disconnect() }
+        scope.launch { OpenClawClient.disconnect(); SoqueteClient.disconnect() }
         updateNotification("Listo — presiona el botón para iniciar")
     }
 
@@ -224,7 +241,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         isServiceActive = false
         destroyRecognizer()
         accumulatedText.clear()
-        scope.launch { OpenClawClient.disconnect() }
+        scope.launch { OpenClawClient.disconnect(); SoqueteClient.disconnect() }
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -254,6 +271,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
 
                 val accumulated = accumulatedText.toString()
                 val kwIndex     = accumulated.lowercase().indexOf(sendKeyword.lowercase())
+                val soqueteIdx  = accumulated.lowercase().indexOf(soqueteKeyword.lowercase())
 
                 if (kwIndex >= 0) {
                     val toSend = accumulated.substring(0, kwIndex).trim()
@@ -262,7 +280,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                     if (toSend.isNotBlank()) {
                         // Short confirmation beep so the user knows the keyword was detected
                         playKeywordBeep()
-                        log("Enviando: $toSend")
+                        log("[OpenClaw] Enviando: $toSend")
                         serviceState = ServiceState.PROCESSING
                         destroyRecognizer()
                         scope.launch {
@@ -270,12 +288,12 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                             mainHandler.post {
                                 if (!isServiceActive) return@post
                                 if (response == null) {
-                                    log("Sin respuesta o error de conexión", true)
+                                    log("[OpenClaw] Sin respuesta o error de conexión", true)
                                     serviceState = ServiceState.LISTENING
                                     initSpeechRecognizer()
                                     startListening()
                                 } else {
-                                    log("Respuesta: $response")
+                                    log("[OpenClaw] Respuesta: $response")
                                     serviceState = ServiceState.SPEAKING
                                     speak(response)
                                 }
@@ -283,6 +301,34 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                         }
                     } else {
                         // Keyword with no preceding text — restart silently
+                        startListening()
+                    }
+                } else if (soqueteIdx >= 0) {
+                    val toSend = accumulated.substring(0, soqueteIdx).trim()
+                    accumulatedText.clear()
+
+                    if (toSend.isNotBlank()) {
+                        playKeywordBeep()
+                        log("[Soquete] Enviando: $toSend")
+                        serviceState = ServiceState.PROCESSING
+                        destroyRecognizer()
+                        scope.launch {
+                            val response = SoqueteClient.send(toSend)
+                            mainHandler.post {
+                                if (!isServiceActive) return@post
+                                if (response == null) {
+                                    log("[Soquete] Sin respuesta o error de conexión", true)
+                                    serviceState = ServiceState.LISTENING
+                                    initSpeechRecognizer()
+                                    startListening()
+                                } else {
+                                    log("[Soquete] Respuesta: $response")
+                                    serviceState = ServiceState.SPEAKING
+                                    speak(response)
+                                }
+                            }
+                        }
+                    } else {
                         startListening()
                     }
                 } else {
@@ -485,12 +531,15 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         if (!isServiceActive) {
             isServiceActive = true
             updateNotification("Conectando...")
-            val prefs   = getSharedPreferences("vas_prefs", MODE_PRIVATE)
-            sendKeyword = prefs.getString("send_keyword", DEFAULT_SEND_KEYWORD) ?: DEFAULT_SEND_KEYWORD
-            val host    = prefs.getString("host",  "") ?: ""
-            val port    = prefs.getString("port",  "18789") ?: "18789"
-            val token   = prefs.getString("token", "") ?: ""
-            launchConnect(host, port, token)
+            val prefs        = getSharedPreferences("vas_prefs", MODE_PRIVATE)
+            sendKeyword      = prefs.getString("send_keyword", DEFAULT_SEND_KEYWORD) ?: DEFAULT_SEND_KEYWORD
+            soqueteKeyword   = prefs.getString("soquete_keyword", DEFAULT_SOQUETE_KEYWORD) ?: DEFAULT_SOQUETE_KEYWORD
+            val host         = prefs.getString("host",  "") ?: ""
+            val port         = prefs.getString("port",  "18789") ?: "18789"
+            val token        = prefs.getString("token", "") ?: ""
+            val soquetePort  = prefs.getString("soquete_port",  "18690") ?: "18690"
+            val soqueteToken = prefs.getString("soquete_token", "") ?: ""
+            launchConnect(host, port, token, soquetePort, soqueteToken)
         } else {
             doStop()
         }

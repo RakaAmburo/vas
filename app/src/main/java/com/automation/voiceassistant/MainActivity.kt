@@ -117,8 +117,11 @@ class MainActivity : ComponentActivity() {
         var host by remember { mutableStateOf(prefs.getString("host", "") ?: "") }
         var port by remember { mutableStateOf(prefs.getString("port", "18789") ?: "18789") }
         var token by remember { mutableStateOf(prefs.getString("token", "") ?: "") }
+        var soquetePort by remember { mutableStateOf(prefs.getString("soquete_port", "18690") ?: "18690") }
+        var soqueteToken by remember { mutableStateOf(prefs.getString("soquete_token", "") ?: "") }
         var showConfig by remember { mutableStateOf(false) }
         var tokenVisible by remember { mutableStateOf(false) }
+        var soqueteTokenVisible by remember { mutableStateOf(false) }
 
         // Callback para cuando el QR es escaneado — actualiza el state y prefs
         onQrScanned = { scanned ->
@@ -178,7 +181,7 @@ class MainActivity : ComponentActivity() {
                     OutlinedTextField(
                         value = port,
                         onValueChange = { port = it; prefs.edit().putString("port", it).apply() },
-                        label = { Text("Puerto") },
+                        label = { Text("Puerto OpenClaw") },
                         modifier = Modifier.fillMaxWidth()
                     )
 
@@ -191,7 +194,7 @@ class MainActivity : ComponentActivity() {
                         OutlinedTextField(
                             value = token,
                             onValueChange = { token = it; prefs.edit().putString("token", it).apply() },
-                            label = { Text("Token OpenClaw") },
+                            label = { Text("Token OpenClaw") },  // OpenClaw
                             visualTransformation = if (tokenVisible) VisualTransformation.None else PasswordVisualTransformation(),
                             trailingIcon = {
                                 IconButton(onClick = { tokenVisible = !tokenVisible }) {
@@ -222,6 +225,32 @@ class MainActivity : ComponentActivity() {
                             )
                         }
                     }
+
+                    // ── Soquete (segundo WS) ────────────────────────────────
+                    Divider(modifier = Modifier.padding(vertical = 4.dp))
+                    Text("Soquete", style = MaterialTheme.typography.labelLarge)
+                    OutlinedTextField(
+                        value = soquetePort,
+                        onValueChange = { soquetePort = it; prefs.edit().putString("soquete_port", it).apply() },
+                        label = { Text("Puerto Soquete") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = soqueteToken,
+                        onValueChange = { soqueteToken = it; prefs.edit().putString("soquete_token", it).apply() },
+                        label = { Text("Token Soquete") },
+                        visualTransformation = if (soqueteTokenVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            IconButton(onClick = { soqueteTokenVisible = !soqueteTokenVisible }) {
+                                Icon(
+                                    imageVector = if (soqueteTokenVisible) Icons.Default.LockOpen else Icons.Default.Lock,
+                                    contentDescription = if (soqueteTokenVisible) "Ocultar token" else "Mostrar token",
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    )
                 }
             }
 

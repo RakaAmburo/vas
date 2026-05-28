@@ -70,3 +70,25 @@ dependencies {
     debugImplementation(libs.androidx.ui.tooling)
     debugImplementation(libs.androidx.ui.test.manifest)
 }
+
+tasks.register("backApk") {
+    group = "MyTools"
+    description = "Copy APK to voiceAssistantBack folder with rotation"
+    doLast {
+        val backupDir = file("C:\\Users\\pablo\\Dropbox\\voiceAssistantBack")
+        backupDir.mkdirs()
+        val apk = layout.buildDirectory.file("outputs/apk/debug/app-debug.apk").get().asFile
+
+        val backup2 = File(backupDir, "app-debug-2.apk")
+        val backup1 = File(backupDir, "app-debug-1.apk")
+        val current = File(backupDir, "app-debug.apk")
+
+        if (backup1.exists()) backup1.renameTo(backup2)
+        if (current.exists()) current.renameTo(backup1)
+
+        copy {
+            from(apk)
+            into(backupDir)
+        }
+    }
+}

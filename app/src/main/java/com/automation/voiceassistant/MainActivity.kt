@@ -30,6 +30,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
@@ -46,6 +47,8 @@ class MainActivity : ComponentActivity() {
 
     // Estado activo accesible desde dispatchKeyEvent (AB Shutter 3) — observable por Compose
     private val isServiceActive = mutableStateOf(false)
+    // true cuando el mic está en pausa (VOLUME_DOWN toggled)
+    private val isMicPaused = mutableStateOf(false)
 
     private val logReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -59,6 +62,11 @@ class MainActivity : ComponentActivity() {
                 VoiceService.ACTION_STATE -> {
                     // Sincroniza el botón visual con el estado real del servicio
                     isServiceActive.value = intent.getBooleanExtra(VoiceService.EXTRA_IS_ACTIVE, false)
+                    if (intent.hasExtra(VoiceService.EXTRA_MIC_PAUSED)) {
+                        isMicPaused.value = intent.getBooleanExtra(VoiceService.EXTRA_MIC_PAUSED, false)
+                    } else if (!isServiceActive.value) {
+                        isMicPaused.value = false
+                    }
                 }
             }
         }
@@ -114,6 +122,7 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun MainScreen() {
         val isActive by isServiceActive
+        val micPaused by isMicPaused
         var host by remember { mutableStateOf(prefs.getString("host", "") ?: "") }
         var port by remember { mutableStateOf(prefs.getString("port", "18789") ?: "18789") }
         var token by remember { mutableStateOf(prefs.getString("token", "") ?: "") }
@@ -151,6 +160,7 @@ class MainActivity : ComponentActivity() {
                     if (isActive) {
                         stopVoiceService()
                         isServiceActive.value = false
+                        isMicPaused.value = false
                     } else {
                         if (checkPermissions()) {
                             startVoiceService()
@@ -158,14 +168,27 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 },
-                modifier = Modifier.size(120.dp),
+                modifier = Modifier
+                    .width(160.dp)
+                    .height(120.dp),
                 shape = MaterialTheme.shapes.extraLarge,
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isActive) MaterialTheme.colorScheme.error
-                    else MaterialTheme.colorScheme.primary
+                    containerColor = when {
+                        isActive && micPaused -> MaterialTheme.colorScheme.tertiary
+                        isActive -> MaterialTheme.colorScheme.error
+                        else -> MaterialTheme.colorScheme.primary
+                    }
                 )
             ) {
-                Text(if (isActive) "STOP" else "START", style = MaterialTheme.typography.titleLarge)
+                Text(
+                    text = when {
+                        isActive && micPaused -> "PAUSA"
+                        isActive -> "STOP"
+                        else -> "START"
+                    },
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.Bold
+                )
             }
 
             TextButton(onClick = { showConfig = !showConfig }) {
@@ -320,14 +343,15 @@ class MainActivity : ComponentActivity() {
     }
 
     // ── AB Shutter 3 (BT HID) ───────────────────────────────────────
-    // VOLUME_UP → toggle start/stop
-    // VOLUME_DOWN → reservado para función futura
+    // VOLUME_UP   → toggle start/stop (conecta WebSocket + inicia reconocimiento de voz)
+    // VOLUME_DOWN → toggle pausa/reanuda micrófono (sin desconectar WS)
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         when (keyCode) {
             KeyEvent.KEYCODE_VOLUME_UP -> {
                 if (isServiceActive.value) {
                     stopVoiceService()
                     isServiceActive.value = false
+                    isMicPaused.value = false
                 } else {
                     if (checkPermissions()) {
                         startVoiceService()
@@ -337,7 +361,9 @@ class MainActivity : ComponentActivity() {
                 return true  // consume: no sube el volumen
             }
             KeyEvent.KEYCODE_VOLUME_DOWN -> {
-                // Reservado — no hace nada por ahora
+                if (isServiceActive.value) {
+                    toggleMic()
+                }
                 return true  // consume: no baja el volumen
             }
         }
@@ -366,6 +392,12 @@ class MainActivity : ComponentActivity() {
     private fun stopVoiceService() {
         startService(
             Intent(this, VoiceService::class.java).apply { action = VoiceService.ACTION_STOP }
+        )
+    }
+
+    private fun toggleMic() {
+        startService(
+            Intent(this, VoiceService::class.java).apply { action = VoiceService.ACTION_TOGGLE_MIC }
         )
     }
 }

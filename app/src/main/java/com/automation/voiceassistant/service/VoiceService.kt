@@ -41,15 +41,18 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         const val ACTION_START      = "START"
         const val ACTION_STOP       = "STOP"
         const val ACTION_KILL       = "KILL"
+        const val ACTION_TOGGLE_MIC = "TOGGLE_MIC"
         /** Broadcast enviado a MainActivity cuando el estado activo cambia */
         const val ACTION_STATE      = "com.automation.voiceassistant.SERVICE_STATE"
         const val EXTRA_IS_ACTIVE   = "is_active"
+        const val EXTRA_MIC_PAUSED  = "mic_paused"
         private const val DEFAULT_SEND_KEYWORD = "cambio"
         private const val DEFAULT_SOQUETE_KEYWORD = "zoquete"
+        private const val PROCESSING_TIMEOUT_MS = 30_000L
     }
 
     // ── State machine ────────────────────────────────────────────────
-    enum class ServiceState { IDLE, LISTENING, PROCESSING, SPEAKING }
+    enum class ServiceState { IDLE, LISTENING, PROCESSING, SPEAKING, MIC_PAUSED }
 
     private var serviceState = ServiceState.IDLE
         set(value) {
@@ -60,6 +63,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                 ServiceState.LISTENING  -> { updateNotification("Escuchando..."); updatePlaybackState(true) }
                 ServiceState.PROCESSING -> { updateNotification("Procesando..."); updatePlaybackState(true) }
                 ServiceState.SPEAKING   -> { updateNotification("Respondiendo..."); updatePlaybackState(true) }
+                ServiceState.MIC_PAUSED -> { updateNotification("Micrófono en pausa"); updatePlaybackState(true) }
             }
         }
 
@@ -69,12 +73,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val job   = SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.IO + job)
-
-    // ── Audio (beep suppression) ─────────────────────────────────────
-    private lateinit var audioManager: AudioManager
-    private var savedSystemVol = -1
-    private var savedRingVol   = -1
-    private var savedMusicVol  = -1
 
     // ── Bluetooth headset ────────────────────────────────────────────
     private var mediaSession: MediaSessionCompat? = null
@@ -120,7 +118,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
 
     override fun onCreate() {
         super.onCreate()
-        audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         tts = TextToSpeech(this, this)
         createNotificationChannel()
         initMediaSession()
@@ -156,8 +153,9 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                 val soqueteToken = prefs.getString("soquete_token", "") ?: ""
                 launchConnect(host, port, token, soquetePort, soqueteToken)
             }
-            ACTION_STOP -> doStop()
-            ACTION_KILL -> doKill()
+            ACTION_STOP       -> doStop()
+            ACTION_KILL       -> doKill()
+            ACTION_TOGGLE_MIC -> doToggleMic()
         }
         return START_STICKY
     }
@@ -191,7 +189,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                 if (!isServiceActive) return@post
                 when (result) {
                     is OpenClawClient.ConnectResult.Success -> {
-                        // Conectar también el segundo WS (Soquete) si hay puerto configurado
                         if (soquetePort.isNotEmpty()) {
                             scope.launch {
                                 SoqueteClient.connect(host, soquetePort, soqueteToken) { msg, isError ->
@@ -211,7 +208,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                         pairingPending = true
                         serviceState   = ServiceState.SPEAKING
                         speak("Aprueba el dispositivo en la Raspberry")
-                        // Retry is triggered from TTS onDone when pairingPending == true
                     }
                     is OpenClawClient.ConnectResult.Error -> {
                         log("Error de conexión: ${result.message}", true)
@@ -235,6 +231,42 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         updateNotification("Listo — presiona el botón para iniciar")
     }
 
+    /** Pausa o reanuda el micrófono sin desconectar los WebSockets.
+     *  Funciona en CUALQUIER estado activo (LISTENING, PROCESSING, SPEAKING):
+     *  - Cancela TTS si estaba hablando
+     *  - Cancela el recognizer si estaba escuchando
+     *  - Emite un beep corto de confirmación al pausar
+     *  - Si la respuesta de PROCESSING llega mientras está pausado, se descarta
+     *  MIC_PAUSED → LISTENING: reinicia el recognizer y vuelve a escuchar. */
+    private fun doToggleMic() {
+        if (!isServiceActive) return
+        when (serviceState) {
+            ServiceState.MIC_PAUSED -> {
+                // Reanudar — beep + delay antes de abrir el mic
+                serviceState = ServiceState.LISTENING
+                broadcastMicPaused(false)
+                playMicOnBeep()
+                mainHandler.postDelayed({
+                    if (serviceState == ServiceState.LISTENING) {
+                        initSpeechRecognizer()
+                        startListeningNow()
+                    }
+                }, 350)
+            }
+            ServiceState.IDLE -> { /* no activo, ignorar */ }
+            else -> {
+                // LISTENING, PROCESSING o SPEAKING → pausar
+                tts?.stop()
+                destroyRecognizer()
+                accumulatedText.clear()
+                pairingPending = false
+                serviceState = ServiceState.MIC_PAUSED
+                broadcastMicPaused(true)
+                playPauseBeep()
+            }
+        }
+    }
+
     /** Detiene el servicio completamente. Solo se llama desde ACTION_KILL. */
     private fun doKill() {
         pairingPending  = false
@@ -254,9 +286,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         speechRecognizer?.setRecognitionListener(object : RecognitionListener {
 
             override fun onResults(results: Bundle?) {
-                // Restore all muted streams — both start and end beeps have now fired
-                restoreVolumes()
-
                 if (serviceState != ServiceState.LISTENING) return
 
                 val text = results
@@ -265,7 +294,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
 
                 if (text.isNullOrBlank()) { startListening(); return }
 
-                // Accumulate with a space separator between recognizer batches
                 if (accumulatedText.isNotEmpty()) accumulatedText.append(" ")
                 accumulatedText.append(text)
 
@@ -278,15 +306,28 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                     accumulatedText.clear()
 
                     if (toSend.isNotBlank()) {
-                        // Short confirmation beep so the user knows the keyword was detected
-                        playKeywordBeep()
+                        playMicOffBeep()
                         log("[OpenClaw] Enviando: $toSend")
                         serviceState = ServiceState.PROCESSING
                         destroyRecognizer()
                         scope.launch {
+                            val timeoutRunnable = Runnable {
+                                if (serviceState == ServiceState.PROCESSING) {
+                                    log("[OpenClaw] Timeout — sin respuesta en 30s", true)
+                                    sendTelegramTimeout(toSend)
+                                    if (serviceState == ServiceState.PROCESSING) {
+                                        serviceState = ServiceState.LISTENING
+                                        initSpeechRecognizer()
+                                        startListening()
+                                    }
+                                }
+                            }
+                            mainHandler.postDelayed(timeoutRunnable, PROCESSING_TIMEOUT_MS)
                             val response = OpenClawClient.send(toSend)
                             mainHandler.post {
-                                if (!isServiceActive) return@post
+                                mainHandler.removeCallbacks(timeoutRunnable)
+                                if (!isServiceActive || serviceState == ServiceState.MIC_PAUSED) return@post
+                                if (serviceState != ServiceState.PROCESSING) return@post
                                 if (response == null) {
                                     log("[OpenClaw] Sin respuesta o error de conexión", true)
                                     serviceState = ServiceState.LISTENING
@@ -300,7 +341,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                             }
                         }
                     } else {
-                        // Keyword with no preceding text — restart silently
                         startListening()
                     }
                 } else if (soqueteIdx >= 0) {
@@ -308,14 +348,28 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                     accumulatedText.clear()
 
                     if (toSend.isNotBlank()) {
-                        playKeywordBeep()
+                        playMicOffBeep()
                         log("[Soquete] Enviando: $toSend")
                         serviceState = ServiceState.PROCESSING
                         destroyRecognizer()
                         scope.launch {
+                            val timeoutRunnable = Runnable {
+                                if (serviceState == ServiceState.PROCESSING) {
+                                    log("[Soquete] Timeout — sin respuesta en 30s", true)
+                                    sendTelegramTimeout(toSend)
+                                    if (serviceState == ServiceState.PROCESSING) {
+                                        serviceState = ServiceState.LISTENING
+                                        initSpeechRecognizer()
+                                        startListening()
+                                    }
+                                }
+                            }
+                            mainHandler.postDelayed(timeoutRunnable, PROCESSING_TIMEOUT_MS)
                             val response = SoqueteClient.send(toSend)
                             mainHandler.post {
-                                if (!isServiceActive) return@post
+                                mainHandler.removeCallbacks(timeoutRunnable)
+                                if (!isServiceActive || serviceState == ServiceState.MIC_PAUSED) return@post
+                                if (serviceState != ServiceState.PROCESSING) return@post
                                 if (response == null) {
                                     log("[Soquete] Sin respuesta o error de conexión", true)
                                     serviceState = ServiceState.LISTENING
@@ -332,14 +386,11 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                         startListening()
                     }
                 } else {
-                    // No keyword yet — keep accumulating; restart recognizer immediately (no beep)
                     startListening()
                 }
             }
 
             override fun onError(error: Int) {
-                // Restore all muted streams
-                restoreVolumes()
                 if (serviceState == ServiceState.LISTENING) {
                     mainHandler.postDelayed({
                         if (serviceState == ServiceState.LISTENING) startListening()
@@ -347,8 +398,7 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                 }
             }
 
-            override fun onEndOfSpeech() {}  // STREAM_MUSIC already muted from startListening()
-
+            override fun onEndOfSpeech() {}
             override fun onReadyForSpeech(params: Bundle?) {}
             override fun onBeginningOfSpeech() {}
             override fun onRmsChanged(rmsdB: Float) {}
@@ -358,10 +408,18 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         })
     }
 
+    /** Emite beep y abre el mic con delay de 350ms para que el beep no sea captado. */
     private fun startListening() {
         if (serviceState != ServiceState.LISTENING) return
-        // Mute STREAM_SYSTEM and STREAM_RING to suppress the "start listening" beep
-        muteRecognizerStreams()
+        playMicOnBeep()
+        mainHandler.postDelayed({
+            if (serviceState == ServiceState.LISTENING) startListeningNow()
+        }, 350)
+    }
+
+    /** Abre el mic directamente sin beep ni delay. */
+    private fun startListeningNow() {
+        if (serviceState != ServiceState.LISTENING) return
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-ES")
@@ -370,52 +428,50 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         speechRecognizer?.startListening(intent)
     }
 
-    /** Silences the streams the SpeechRecognizer uses for its start AND end beeps. */
-    private fun muteRecognizerStreams() {
-        try {
-            if (savedSystemVol < 0) savedSystemVol = audioManager.getStreamVolume(AudioManager.STREAM_SYSTEM)
-            if (savedRingVol   < 0) savedRingVol   = audioManager.getStreamVolume(AudioManager.STREAM_RING)
-            if (savedMusicVol  < 0) savedMusicVol  = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-            audioManager.setStreamVolume(AudioManager.STREAM_SYSTEM, 0, 0)
-            audioManager.setStreamVolume(AudioManager.STREAM_RING,   0, 0)
-            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC,  0, 0)
-        } catch (_: Exception) {}
-    }
-
-    /** Restores all muted streams to their pre-mute levels. */
-    private fun restoreVolumes() {
-        try {
-            if (savedSystemVol >= 0) {
-                audioManager.setStreamVolume(AudioManager.STREAM_SYSTEM, savedSystemVol, 0)
-                savedSystemVol = -1
-            }
-            if (savedRingVol >= 0) {
-                audioManager.setStreamVolume(AudioManager.STREAM_RING, savedRingVol, 0)
-                savedRingVol = -1
-            }
-            if (savedMusicVol >= 0) {
-                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, savedMusicVol, 0)
-                savedMusicVol = -1
-            }
-            // Also ensure STREAM_MUSIC adjust-mute is cleared (belt + suspenders)
-            audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
-        } catch (_: Exception) {}
-    }
-
     private fun destroyRecognizer() {
-        restoreVolumes()
         speechRecognizer?.stopListening()
         speechRecognizer?.destroy()
         speechRecognizer = null
     }
 
-    /** Short confirmation beep on STREAM_NOTIFICATION when the send keyword is detected. */
-    private fun playKeywordBeep() {
+    /** Beep corto — mic activado. */
+    private fun playMicOnBeep() {
         try {
-            val tg = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 80)
-            tg.startTone(ToneGenerator.TONE_PROP_BEEP2, 200)
-            mainHandler.postDelayed({ tg.release() }, 400)
+            val tg = ToneGenerator(AudioManager.STREAM_MUSIC, 60)
+            tg.startTone(ToneGenerator.TONE_PROP_BEEP, 150)
+            mainHandler.postDelayed({ tg.release() }, 300)
         } catch (_: Exception) {}
+    }
+
+    /** Beep doble — mic desactivado (keyword detectada). */
+    private fun playMicOffBeep() {
+        try {
+            val tg = ToneGenerator(AudioManager.STREAM_MUSIC, 60)
+            tg.startTone(ToneGenerator.TONE_PROP_BEEP2, 150)
+            mainHandler.postDelayed({ tg.release() }, 300)
+        } catch (_: Exception) {}
+    }
+
+    /** Beep de pausa — pulso largo. */
+    private fun playPauseBeep() {
+        try {
+            val tg = ToneGenerator(AudioManager.STREAM_MUSIC, 80)
+            tg.startTone(ToneGenerator.TONE_CDMA_PIP, 300)
+            mainHandler.postDelayed({ tg.release() }, 500)
+        } catch (_: Exception) {}
+    }
+
+    /** Envía aviso por Telegram cuando se agota el timeout de PROCESSING. */
+    private fun sendTelegramTimeout(originalMessage: String) {
+        scope.launch(Dispatchers.IO) {
+            try {
+                val msg = "[VoiceAssistant] Procesando tu mensaje (timeout 30s): \"\""
+                Runtime.getRuntime().exec(arrayOf(
+                    "python", "/home/pablo/repos/misc-tools/telegram.py",
+                    "--message", msg
+                ))
+            } catch (_: Exception) {}
+        }
     }
 
     // ── TTS ──────────────────────────────────────────────────────────
@@ -423,7 +479,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     private fun speak(text: String) {
         val clean = TtsTextCleaner.clean(text)
         if (clean.isBlank()) {
-            // Nothing left to say after cleaning — skip straight back to listening
             mainHandler.post {
                 if (isServiceActive && serviceState == ServiceState.SPEAKING) {
                     serviceState = ServiceState.LISTENING
@@ -440,9 +495,9 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
      * La lógica de limpieza de texto fue extraída a [TtsTextCleaner.clean].
      *
      * Cambios respecto a la versión anterior:
-     * - Bug fix: la expresión para código inline usaba `"$1"` sin grupo de captura,
+     * - Bug fix: la expresión para código inline usaba "$1" sin grupo de captura,
      *   lo que causaba una excepción en tiempo de ejecución y eliminaba el texto
-     *   entre backticks en lugar de conservarlo. Corregido: `` `([^`\n]*)` `` → `"$1"`.
+     *   entre backticks en lugar de conservarlo. Corregido: `([^`\n]*)` → "$1".
      * - Se añade un paso extra para eliminar backticks sueltos que sobreviven al
      *   paso de código inline.
      * - El guion `-` fue removido del conjunto de símbolos eliminados para no
@@ -462,7 +517,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                         if (!isServiceActive || serviceState != ServiceState.SPEAKING) return@post
                         if (pairingPending) {
                             pairingPending = false
-                            // Retry connect after 5 s to give the user time to approve pairing
                             mainHandler.postDelayed({
                                 if (isServiceActive) launchConnect(pairingHost, pairingPort, pairingToken)
                             }, 5_000)
@@ -504,9 +558,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
             setMediaButtonReceiver(mediaButtonPendingIntent)
             setCallback(object : MediaSessionCompat.Callback() {
                 override fun onMediaButtonEvent(mediaButtonEvent: Intent): Boolean {
-                    // Solo KEYCODE_HEADSETHOOK y KEYCODE_MEDIA_PLAY_PAUSE llegan aquí.
-                    // KEYCODE_VOLUME_UP/DOWN NO llegan nunca por MediaSession — van por
-                    // el sistema de audio y no se pueden interceptar con pantalla apagada.
                     val event = mediaButtonEvent.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
                     if (event?.action == KeyEvent.ACTION_DOWN) {
                         when (event.keyCode) {
@@ -519,7 +570,6 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
             })
             isActive = true
         }
-        // Establecemos STATE_PLAYING inmediatamente — ver comentario en updatePlaybackState().
         updatePlaybackState(playing = true)
     }
 
@@ -551,8 +601,8 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         val channel = NotificationChannel(
             CHANNEL_ID, "Voice Assistant", NotificationManager.IMPORTANCE_MIN
         ).apply {
-            setShowBadge(false)          // sin punto en el ícono de la app
-            setSound(null, null)         // sin sonido
+            setShowBadge(false)
+            setSound(null, null)
             enableVibration(false)
         }
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
@@ -577,11 +627,19 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
 
     // ── State broadcast ──────────────────────────────────────────────
 
-    /** Notifica a MainActivity si el servicio está activo (conectando/escuchando) o en IDLE. */
     private fun broadcastActive(active: Boolean) {
         val intent = Intent(ACTION_STATE).apply {
             setPackage(packageName)
             putExtra(EXTRA_IS_ACTIVE, active)
+        }
+        sendBroadcast(intent)
+    }
+
+    private fun broadcastMicPaused(paused: Boolean) {
+        val intent = Intent(ACTION_STATE).apply {
+            setPackage(packageName)
+            putExtra(EXTRA_IS_ACTIVE, true)
+            putExtra(EXTRA_MIC_PAUSED, paused)
         }
         sendBroadcast(intent)
     }

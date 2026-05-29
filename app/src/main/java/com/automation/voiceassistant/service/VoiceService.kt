@@ -74,6 +74,9 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     private val job   = SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.IO + job)
 
+    // ── TTS buffer — respuestas que llegan mientras el mic está escuchando ──
+    private val ttsBuffer = ArrayDeque<String>()
+
     // ── Bluetooth headset ────────────────────────────────────────────
     private var mediaSession: MediaSessionCompat? = null
 
@@ -227,17 +230,17 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         serviceState    = ServiceState.IDLE
         destroyRecognizer()
         accumulatedText.clear()
+        ttsBuffer.clear()
         scope.launch { OpenClawClient.disconnect(); SoqueteClient.disconnect() }
         updateNotification("Listo — presiona el botón para iniciar")
     }
 
-    /** Pausa o reanuda el micrófono sin desconectar los WebSockets.
-     *  Funciona en CUALQUIER estado activo (LISTENING, PROCESSING, SPEAKING):
-     *  - Cancela TTS si estaba hablando
-     *  - Cancela el recognizer si estaba escuchando
-     *  - Emite un beep corto de confirmación al pausar
-     *  - Si la respuesta de PROCESSING llega mientras está pausado, se descarta
-     *  MIC_PAUSED → LISTENING: reinicia el recognizer y vuelve a escuchar. */
+    /** Toggle mic — pausa y reanuda el reconocimiento de voz.
+     *  El mic es INDEPENDIENTE de los WebSockets:
+     *  - Pausar solo detiene el recognizer; los WS siguen activos.
+     *  - Si llega una respuesta WS mientras el mic escucha (LISTENING) → se bufferiza.
+     *  - Si llega mientras está en pausa (MIC_PAUSED) → se reproduce directamente.
+     *  - Al reanudar desde MIC_PAUSED → vuelve a escuchar (el buffer ya se habrá reproducido). */
     private fun doToggleMic() {
         if (!isServiceActive) return
         when (serviceState) {
@@ -255,11 +258,9 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
             }
             ServiceState.IDLE -> { /* no activo, ignorar */ }
             else -> {
-                // LISTENING, PROCESSING o SPEAKING → pausar
-                tts?.stop()
+                // LISTENING, PROCESSING o SPEAKING → solo para el recognizer, NO el WS
                 destroyRecognizer()
                 accumulatedText.clear()
-                pairingPending = false
                 serviceState = ServiceState.MIC_PAUSED
                 broadcastMicPaused(true)
                 playPauseBeep()
@@ -273,9 +274,34 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
         isServiceActive = false
         destroyRecognizer()
         accumulatedText.clear()
+        ttsBuffer.clear()
         scope.launch { OpenClawClient.disconnect(); SoqueteClient.disconnect() }
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    /** Entrega una respuesta recibida del WS.
+     *  - Si el mic está escuchando (LISTENING): bufferiza para no interrumpir.
+     *  - Si el mic está en pausa (MIC_PAUSED): reproduce directamente por TTS.
+     *  - En cualquier otro caso (PROCESSING, SPEAKING): reproduce normal. */
+    private fun deliverResponse(response: String, tag: String) {
+        log("$tag Respuesta: $response")
+        when (serviceState) {
+            ServiceState.LISTENING -> {
+                // Mic ocupado escuchando — bufferizar para después
+                ttsBuffer.addLast(response)
+                log("$tag Respuesta bufferizada (mic escuchando)")
+            }
+            ServiceState.MIC_PAUSED -> {
+                // Mic pausado — reproducir directamente, quedarse en MIC_PAUSED al terminar
+                serviceState = ServiceState.SPEAKING
+                speak(response)
+            }
+            else -> {
+                serviceState = ServiceState.SPEAKING
+                speak(response)
+            }
+        }
     }
 
     // ── Speech recognizer ────────────────────────────────────────────
@@ -326,17 +352,14 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                             val response = OpenClawClient.send(toSend)
                             mainHandler.post {
                                 mainHandler.removeCallbacks(timeoutRunnable)
-                                if (!isServiceActive || serviceState == ServiceState.MIC_PAUSED) return@post
-                                if (serviceState != ServiceState.PROCESSING) return@post
+                                if (!isServiceActive) return@post
                                 if (response == null) {
                                     log("[OpenClaw] Sin respuesta o error de conexión", true)
                                     serviceState = ServiceState.LISTENING
                                     initSpeechRecognizer()
                                     startListening()
                                 } else {
-                                    log("[OpenClaw] Respuesta: $response")
-                                    serviceState = ServiceState.SPEAKING
-                                    speak(response)
+                                    deliverResponse(response, "[OpenClaw]")
                                 }
                             }
                         }
@@ -368,17 +391,14 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                             val response = SoqueteClient.send(toSend)
                             mainHandler.post {
                                 mainHandler.removeCallbacks(timeoutRunnable)
-                                if (!isServiceActive || serviceState == ServiceState.MIC_PAUSED) return@post
-                                if (serviceState != ServiceState.PROCESSING) return@post
+                                if (!isServiceActive) return@post
                                 if (response == null) {
                                     log("[Soquete] Sin respuesta o error de conexión", true)
                                     serviceState = ServiceState.LISTENING
                                     initSpeechRecognizer()
                                     startListening()
                                 } else {
-                                    log("[Soquete] Respuesta: $response")
-                                    serviceState = ServiceState.SPEAKING
-                                    speak(response)
+                                    deliverResponse(response, "[Soquete]")
                                 }
                             }
                         }
@@ -479,16 +499,39 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
     private fun speak(text: String) {
         val clean = TtsTextCleaner.clean(text)
         if (clean.isBlank()) {
-            mainHandler.post {
-                if (isServiceActive && serviceState == ServiceState.SPEAKING) {
+            mainHandler.post { onTtsDone() }
+            return
+        }
+        tts?.speak(clean, TextToSpeech.QUEUE_FLUSH, null, "tts_done")
+    }
+
+    /** Lógica post-TTS centralizada. */
+    private fun onTtsDone() {
+        if (!isServiceActive) return
+        when (serviceState) {
+            ServiceState.SPEAKING -> {
+                if (pairingPending) {
+                    pairingPending = false
+                    mainHandler.postDelayed({
+                        if (isServiceActive) launchConnect(pairingHost, pairingPort, pairingToken)
+                    }, 5_000)
+                } else {
+                    // Volver a escuchar
                     serviceState = ServiceState.LISTENING
                     initSpeechRecognizer()
                     startListening()
                 }
             }
-            return
+            ServiceState.MIC_PAUSED -> {
+                // TTS terminó pero el mic está en pausa — no reactivar mic
+                // Reproducir siguiente del buffer si hay
+                if (ttsBuffer.isNotEmpty()) {
+                    speak(ttsBuffer.removeFirst())
+                }
+                // si no hay más, quedarse en MIC_PAUSED
+            }
+            else -> { /* no hacer nada */ }
         }
-        tts?.speak(clean, TextToSpeech.QUEUE_FLUSH, null, "tts_done")
     }
 
     /**
@@ -513,28 +556,11 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                 override fun onStart(utteranceId: String?) {}
 
                 override fun onDone(utteranceId: String?) {
-                    mainHandler.post {
-                        if (!isServiceActive || serviceState != ServiceState.SPEAKING) return@post
-                        if (pairingPending) {
-                            pairingPending = false
-                            mainHandler.postDelayed({
-                                if (isServiceActive) launchConnect(pairingHost, pairingPort, pairingToken)
-                            }, 5_000)
-                        } else {
-                            serviceState = ServiceState.LISTENING
-                            initSpeechRecognizer()
-                            startListening()
-                        }
-                    }
+                    mainHandler.post { onTtsDone() }
                 }
 
                 override fun onError(utteranceId: String?) {
-                    mainHandler.post {
-                        if (!isServiceActive || serviceState != ServiceState.SPEAKING) return@post
-                        serviceState = ServiceState.LISTENING
-                        initSpeechRecognizer()
-                        startListening()
-                    }
+                    mainHandler.post { onTtsDone() }
                 }
             })
         }

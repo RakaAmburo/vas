@@ -13,6 +13,9 @@ import java.util.concurrent.TimeUnit
  *   1. Al conectar → enviar {"key": "<token>"}
  *   2. Servidor responde {"msg": "authenticated"}
  *   3. Enviar mensajes con {"msg": "<texto>"} → responde {"msg": "<respuesta>"}
+ *
+ * Push notifications:
+ *   - Mensajes espontáneos del servidor (sin send() en curso) → pushHandler
  */
 object SoqueteClient {
 
@@ -38,6 +41,9 @@ object SoqueteClient {
     @Volatile private var closeHandler:   ((Int, String?) -> Unit)? = null
     @Volatile private var errorHandler:   ((Exception?) -> Unit)?  = null
 
+    /** Invocado cuando llega un mensaje push del servidor (fuera de un send()). */
+    @Volatile var pushHandler: ((String) -> Unit)? = null
+
     fun connect(
         host: String,
         port: String,
@@ -59,6 +65,7 @@ object SoqueteClient {
         messageHandler = null
         closeHandler   = null
         errorHandler   = null
+        pushHandler    = null
         synchronized(this) {
             state = ConnectionState.DISCONNECTED
             ws?.close()
@@ -158,8 +165,20 @@ object SoqueteClient {
                 send(JSONObject().put("key", savedToken).toString())
             }
             override fun onMessage(raw: String) {
-                try { messageHandler?.invoke(JSONObject(raw)) }
-                catch (e: Exception) { onLog("[Soquete] Error procesando mensaje: ${e.message}", true) }
+                try {
+                    val json = JSONObject(raw)
+                    if (messageHandler != null) {
+                        // send() en curso o handshake — handler normal
+                        messageHandler?.invoke(json)
+                    } else {
+                        // Mensaje push espontáneo del servidor
+                        val text = json.optString("msg").takeIf { it.isNotEmpty() }
+                        if (text != null) {
+                            onLog("[Soquete] Push recibido: $text", false)
+                            pushHandler?.invoke(text)
+                        }
+                    }
+                } catch (e: Exception) { onLog("[Soquete] Error procesando mensaje: ${e.message}", true) }
             }
             override fun onClose(code: Int, reason: String?, remote: Boolean) {
                 onLog("[Soquete] WS Cerrado: code=$code reason='$reason'", code != 1000)

@@ -197,6 +197,10 @@ class VoiceService : Service(), TextToSpeech.OnInitListener {
                                 SoqueteClient.connect(host, soquetePort, soqueteToken) { msg, isError ->
                                     mainHandler.post { log(msg, isError) }
                                 }
+                                // Register push handler for server-initiated notifications
+                                SoqueteClient.pushHandler = { text ->
+                                    mainHandler.post { deliverResponse(text, "[Soquete]") }
+                                }
                             }
                         }
                         serviceState = ServiceState.LISTENING

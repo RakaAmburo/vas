@@ -72,6 +72,7 @@ dependencies {
 }
 
 tasks.register("backApk") {
+    dependsOn("assembleDebug")
     group = "MyTools"
     description = "Copy APK to voiceAssistantBack folder with rotation"
     doLast {
